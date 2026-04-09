@@ -1,0 +1,44 @@
+services:
+  crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # ── Liga/desliga o crawler sem derrubar o container ──
+      CRAWLER_ENABLED: ${CRAWLER_ENABLED:-false}
+
+      # ── Quantidade de workers ────────────────────────────
+      LIGHT_WORKERS: ${LIGHT_WORKERS:-3}
+      PLAYWRIGHT_WORKERS: ${PLAYWRIGHT_WORKERS:-1}
+
+      # ── Banco de dados ───────────────────────────────────
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASS: ${DB_PASS}
+
+      # ── Embedding API ────────────────────────────────────
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL:-https://ai.micaelmuniz.com/api/embed}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+
+      # ── Comportamento do crawler ─────────────────────────
+      CRAWL_DELAY_MS: ${CRAWL_DELAY_MS:-1000}
+      MAX_DEPTH: ${MAX_DEPTH:-3}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-15}
+
+    # Playwright precisa de memória extra por instância
+    # 3 light (~150MB) + 1 playwright (~500MB) + overhead = ~1GB seguro
+    mem_limit: 1500m
+    mem_reservation: 512m
+
+    # Shm necessário pro Chromium não crashar
+    shm_size: 256mb
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"

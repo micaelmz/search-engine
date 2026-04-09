@@ -1,0 +1,63 @@
+#!/bin/bash
+set -e
+
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║         🕷  Crawler Worker           ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
+
+# ── Valida se o crawler deve rodar ───────────────────────────────────────────
+
+if [ "${CRAWLER_ENABLED:-false}" != "true" ]; then
+  echo "⏸  CRAWLER_ENABLED != true — crawler pausado."
+  echo "   Sete CRAWLER_ENABLED=true no env para iniciar."
+  echo ""
+  # Mantém o container vivo sem fazer nada (útil no Dokploy pra não reiniciar em loop)
+  exec tail -f /dev/null
+fi
+
+echo "✅ CRAWLER_ENABLED=true — iniciando workers..."
+echo ""
+
+# ── Configurações de workers ──────────────────────────────────────────────────
+
+LIGHT_WORKERS=${LIGHT_WORKERS:-3}
+PLAYWRIGHT_WORKERS=${PLAYWRIGHT_WORKERS:-1}
+
+echo "📋 Configuração:"
+echo "   Workers leves (httpx):      $LIGHT_WORKERS"
+echo "   Workers Playwright:         $PLAYWRIGHT_WORKERS"
+echo "   Max depth:                  ${MAX_DEPTH:-3}"
+echo "   Delay por domínio:          ${CRAWL_DELAY_MS:-1000}ms"
+echo ""
+
+# ── Sobe workers leves ────────────────────────────────────────────────────────
+
+echo "🚀 Subindo $LIGHT_WORKERS workers leves..."
+for i in $(seq 1 $LIGHT_WORKERS); do
+  python crawler_light.py 2>&1 | sed "s/^/[light-$i] /" &
+  echo "   ↳ light-worker-$i PID=$!"
+  sleep 0.5  # evita thundering herd na fila
+done
+
+# ── Sobe workers Playwright ───────────────────────────────────────────────────
+
+echo ""
+echo "🎭 Subindo $PLAYWRIGHT_WORKERS workers Playwright..."
+for i in $(seq 1 $PLAYWRIGHT_WORKERS); do
+  python crawler_playwright.py 2>&1 | sed "s/^/[playwright-$i] /" &
+  echo "   ↳ playwright-worker-$i PID=$!"
+  sleep 1
+done
+
+echo ""
+echo "✅ Todos os workers rodando. Logs abaixo:"
+echo "══════════════════════════════════════════"
+
+# Aguarda qualquer processo filho terminar (se um morrer, o container reinicia)
+wait -n
+
+echo ""
+echo "⚠️  Um worker terminou inesperadamente. Container encerrando para o Dokploy reiniciar."
+exit 1
