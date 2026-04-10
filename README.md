@@ -26,12 +26,12 @@ python crawler_light.py
 
 Variáveis úteis para performance do crawler leve:
 ```bash
-CRAWLER_CONCURRENCY=10   # quantas URLs processar em paralelo por processo
-CRAWLER_BATCH_SIZE=20    # quantas URLs pegar da fila por iteração
+CONCURRENT_REQUESTS=20   # quantas URLs processar em paralelo no worker async
+CRAWLER_BATCH_SIZE=40    # quantas URLs pegar da fila por iteração
 ```
 
-Com versão assíncrona, prefira menos processos e mais concorrência por processo.
-Exemplo inicial no Docker: `LIGHT_WORKERS=1` e `CRAWLER_CONCURRENCY=10`.
+Com versão assíncrona, o recomendado é 1 worker leve com concorrência interna alta.
+Exemplo inicial no Docker: `CONCURRENT_REQUESTS=20` e `CRAWLER_BATCH_SIZE=40`.
 
 **Crawler pesado (Playwright) — pra sites JS:**
 ```bash

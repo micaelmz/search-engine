@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
 # Dependências do sistema necessárias para o Chromium no ARM/Debian Trixie
 # playwright install-deps não funciona nesse combo, instalamos manualmente
 RUN apt-get update && apt-get install -y \

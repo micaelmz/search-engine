@@ -6,7 +6,6 @@ Ideal para sites que retornam conteúdo no HTML estático.
 import sys
 import os
 import asyncio
-import time
 import random
 import httpx
 import logging
@@ -338,7 +337,12 @@ async def crawl_url_async(
             return CrawlResult(item_id=item.id, url=item.url, domain=item.domain, depth=item.depth, ok=False, error=str(e))
 
 
-async def process_batch(engine, items: list[QueueItem]):
+async def process_batch(
+    engine,
+    items: list[QueueItem],
+    web_client: httpx.AsyncClient,
+    embedding_client: httpx.AsyncClient,
+):
     if not items:
         return
 
@@ -347,46 +351,42 @@ async def process_batch(engine, items: list[QueueItem]):
         rules = get_or_create_domain_rules(session, domains)
 
         missing_robots = [d for d in domains if not rules[d].robots_txt]
-    limits = httpx.Limits(max_connections=max(20, CRAWLER_CONCURRENCY * 2), max_keepalive_connections=max(10, CRAWLER_CONCURRENCY))
-    timeout = httpx.Timeout(REQUEST_TIMEOUT)
 
-    async with httpx.AsyncClient(limits=limits, timeout=timeout) as web_client:
-        async with httpx.AsyncClient(limits=limits, timeout=30) as embedding_client:
-            if missing_robots:
-                robots_results = await asyncio.gather(*[
-                    fetch_robots(domain, web_client) for domain in missing_robots
-                ])
-            else:
-                robots_results = []
+    if missing_robots:
+        robots_results = await asyncio.gather(*[
+            fetch_robots(domain, web_client) for domain in missing_robots
+        ])
+    else:
+        robots_results = []
 
-            if missing_robots:
-                with Session(engine) as session:
-                    for domain, robots_txt in zip(missing_robots, robots_results):
-                        session.execute(
-                            update(DomainRule)
-                            .where(DomainRule.domain == domain)
-                            .values(robots_txt=robots_txt)
-                        )
-                    session.commit()
-
-                with Session(engine) as session:
-                    refreshed = session.execute(
-                        select(DomainRule).where(DomainRule.domain.in_(domains))
-                    ).scalars().all()
-                    rules = {r.domain: r for r in refreshed}
-
-            sem = asyncio.Semaphore(CRAWLER_CONCURRENCY)
-            tasks = [
-                crawl_url_async(
-                    item=i,
-                    rule=rules.get(i.domain, DomainRule(domain=i.domain, crawl_delay_ms=CRAWL_DELAY_MS)),
-                    web_client=web_client,
-                    embedding_client=embedding_client,
-                    sem=sem,
+    if missing_robots:
+        with Session(engine) as session:
+            for domain, robots_txt in zip(missing_robots, robots_results):
+                session.execute(
+                    update(DomainRule)
+                    .where(DomainRule.domain == domain)
+                    .values(robots_txt=robots_txt)
                 )
-                for i in items
-            ]
-            results = await asyncio.gather(*tasks)
+            session.commit()
+
+        with Session(engine) as session:
+            refreshed = session.execute(
+                select(DomainRule).where(DomainRule.domain.in_(domains))
+            ).scalars().all()
+            rules = {r.domain: r for r in refreshed}
+
+    sem = asyncio.Semaphore(CRAWLER_CONCURRENCY)
+    tasks = [
+        crawl_url_async(
+            item=i,
+            rule=rules.get(i.domain, DomainRule(domain=i.domain, crawl_delay_ms=CRAWL_DELAY_MS)),
+            web_client=web_client,
+            embedding_client=embedding_client,
+            sem=sem,
+        )
+        for i in items
+    ]
+    results = await asyncio.gather(*tasks)
 
     with Session(engine) as session:
         for result in results:
@@ -457,23 +457,35 @@ async def process_batch(engine, items: list[QueueItem]):
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-def main():
+async def async_main():
     log_info("🕷  Crawler leve (httpx) iniciando...")
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
     log_info(f"Concorrência async: {CRAWLER_CONCURRENCY} | Lote: {CRAWLER_BATCH_SIZE}")
-    while True:
-        with Session(engine) as session:
-            items = claim_next_batch(session, CRAWLER_BATCH_SIZE)
+    limits = httpx.Limits(
+        max_connections=max(50, CRAWLER_CONCURRENCY * 4),
+        max_keepalive_connections=max(20, CRAWLER_CONCURRENCY * 2),
+    )
+    timeout = httpx.Timeout(REQUEST_TIMEOUT)
 
-        if not items:
-            log_warn("Fila vazia. Aguardando 10s...")
-            time.sleep(10)
-            continue
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as web_client:
+        async with httpx.AsyncClient(limits=limits, timeout=30) as embedding_client:
+            while True:
+                with Session(engine) as session:
+                    items = claim_next_batch(session, CRAWLER_BATCH_SIZE)
 
-        log_info(f"\n{'─'*60}")
-        log_info(f"Processando lote com {len(items)} URLs")
-        asyncio.run(process_batch(engine, items))
+                if not items:
+                    log_warn("Fila vazia. Aguardando 10s...")
+                    await asyncio.sleep(10)
+                    continue
+
+                log_info(f"\n{'─'*60}")
+                log_info(f"Processando lote com {len(items)} URLs")
+                await process_batch(engine, items, web_client, embedding_client)
+
+
+def main():
+    asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()

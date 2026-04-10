@@ -22,11 +22,18 @@ echo ""
 
 # ── Configurações de workers ──────────────────────────────────────────────────
 
-LIGHT_WORKERS=${LIGHT_WORKERS:-3}
+CONCURRENT_REQUESTS=${CONCURRENT_REQUESTS:-${CRAWLER_CONCURRENCY:-20}}
+CRAWLER_BATCH_SIZE=${CRAWLER_BATCH_SIZE:-$((CONCURRENT_REQUESTS * 2))}
 PLAYWRIGHT_WORKERS=${PLAYWRIGHT_WORKERS:-1}
 
+# Compatibilidade com config.py (fallback legado)
+export CRAWLER_CONCURRENCY="$CONCURRENT_REQUESTS"
+export CRAWLER_BATCH_SIZE
+
 echo "📋 Configuração:"
-echo "   Workers leves (httpx):      $LIGHT_WORKERS"
+echo "   Worker leve async (httpx):  1"
+echo "   Concurrent requests:        $CONCURRENT_REQUESTS"
+echo "   Batch size:                 $CRAWLER_BATCH_SIZE"
 echo "   Workers Playwright:         $PLAYWRIGHT_WORKERS"
 echo "   Max depth:                  ${MAX_DEPTH:-3}"
 echo "   Delay por domínio:          ${CRAWL_DELAY_MS:-1000}ms"
@@ -34,12 +41,9 @@ echo ""
 
 # ── Sobe workers leves ────────────────────────────────────────────────────────
 
-echo "🚀 Subindo $LIGHT_WORKERS workers leves..."
-for i in $(seq 1 $LIGHT_WORKERS); do
-  python crawler_light.py 2>&1 | sed "s/^/[light-$i] /" &
-  echo "   ↳ light-worker-$i PID=$!"
-  sleep 0.5  # evita thundering herd na fila
-done
+echo "🚀 Subindo 1 worker leve async..."
+python crawler_light.py 2>&1 | sed "s/^/[light-1] /" &
+echo "   ↳ light-worker-1 PID=$!"
 
 # ── Sobe workers Playwright ───────────────────────────────────────────────────
 

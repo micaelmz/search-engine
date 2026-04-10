@@ -9,7 +9,8 @@ services:
       CRAWLER_ENABLED: ${CRAWLER_ENABLED:-false}
 
       # ── Quantidade de workers ────────────────────────────
-      LIGHT_WORKERS: ${LIGHT_WORKERS:-3}
+      CONCURRENT_REQUESTS: ${CONCURRENT_REQUESTS:-20}
+      CRAWLER_BATCH_SIZE: ${CRAWLER_BATCH_SIZE:-40}
       PLAYWRIGHT_WORKERS: ${PLAYWRIGHT_WORKERS:-1}
 
       # ── Banco de dados ───────────────────────────────────
@@ -28,11 +29,10 @@ services:
       CRAWL_DELAY_MS: ${CRAWL_DELAY_MS:-1000}
       MAX_DEPTH: ${MAX_DEPTH:-3}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-15}
-      CRAWLER_CONCURRENCY: ${CRAWLER_CONCURRENCY:-10}
-      CRAWLER_BATCH_SIZE: ${CRAWLER_BATCH_SIZE:-20}
+      CRAWLER_CONCURRENCY: ${CRAWLER_CONCURRENCY:-20}
 
     # Playwright precisa de memória extra por instância
-    # 3 light (~150MB) + 1 playwright (~500MB) + overhead = ~1GB seguro
+    # 1 light async + 1 playwright + overhead
     mem_limit: 1500m
     mem_reservation: 512m
 
