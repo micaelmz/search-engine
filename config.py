@@ -17,6 +17,7 @@ DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{
 EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "https://ai.micaelmuniz.com/api/embed")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+EMBEDDING_ENABLED = os.getenv("EMBEDDING_ENABLED", "false").lower() == "true"
 
 # Crawler settings
 CRAWL_DELAY_MS = int(os.getenv("CRAWL_DELAY_MS", "1000"))

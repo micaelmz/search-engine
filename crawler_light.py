@@ -23,7 +23,7 @@ from config import (
     DATABASE_URL, EMBEDDING_API_URL, EMBEDDING_API_KEY,
     EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE,
-    CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE
+    CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE, EMBEDDING_ENABLED
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 
@@ -58,18 +58,18 @@ def get_domain(url: str) -> str:
 def random_ua() -> str:
     return random.choice(USER_AGENTS)
 
-def extract_text(soup: BeautifulSoup) -> tuple[str | None, str | None, str]:
-    """Retorna (title, summary, raw_text)"""
+def extract_text(soup: BeautifulSoup) -> tuple[str | None, str | None]:
+    """Retorna (title, summary)"""
     title = soup.title.string.strip() if soup.title and soup.title.string else None
 
     # Texto relevante: H1, H2, H3, parágrafos
     relevant_tags = soup.find_all(["h1", "h2", "h3", "p", "li"])
-    raw_text = " ".join(t.get_text(separator=" ", strip=True) for t in relevant_tags)
-    raw_text = " ".join(raw_text.split())  # colapsa espaços
+    content_text = " ".join(t.get_text(separator=" ", strip=True) for t in relevant_tags)
+    content_text = " ".join(content_text.split())  # colapsa espaços
 
-    summary = raw_text[:500] if raw_text else None
+    summary = content_text[:1000] if content_text else None
 
-    return title, summary, raw_text
+    return title, summary
 
 def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     links = []
@@ -153,7 +153,6 @@ class CrawlResult:
     ok: bool
     title: str | None = None
     summary: str | None = None
-    raw_text: str | None = None
     embedding: list[float] | None = None
     links: list[str] | None = None
     needs_js: bool = False
@@ -304,10 +303,10 @@ async def crawl_url_async(
                 return CrawlResult(item_id=item.id, url=item.url, domain=item.domain, depth=item.depth, ok=False, error="nao_html")
 
             soup = BeautifulSoup(r.text, "lxml")
-            title, summary, raw_text = extract_text(soup)
+            title, summary = extract_text(soup)
             links = extract_links(soup, item.url)
 
-            if not raw_text:
+            if not summary:
                 return CrawlResult(
                     item_id=item.id,
                     url=item.url,
@@ -318,7 +317,9 @@ async def crawl_url_async(
                     error="sem_conteudo",
                 )
 
-            embedding = await get_embedding(embedding_client, raw_text)
+            embedding = None
+            if EMBEDDING_ENABLED:
+                embedding = await get_embedding(embedding_client, summary)
             return CrawlResult(
                 item_id=item.id,
                 url=item.url,
@@ -327,7 +328,6 @@ async def crawl_url_async(
                 ok=True,
                 title=title,
                 summary=summary,
-                raw_text=raw_text,
                 embedding=embedding,
                 links=links,
             )
@@ -394,14 +394,16 @@ async def process_batch(
                 log_info(f"[depth={result.depth}] {result.url}")
                 log_dim(f"  título: {result.title}")
                 log_dim(f"  links encontrados: {len(result.links or [])}")
-                log_ok(f"  embedding gerado: {'sim' if result.embedding else 'não'}")
+                if EMBEDDING_ENABLED:
+                    log_ok(f"  embedding gerado: {'sim' if result.embedding else 'não'}")
+                else:
+                    log_dim("  embedding desativado")
 
                 stmt = insert(Page.__table__).values(
                     url=result.url,
                     domain=result.domain,
                     title=result.title,
                     summary=result.summary,
-                    raw_text=result.raw_text,
                     embedding=result.embedding,
                     status="indexed",
                     indexed_at=datetime.now(timezone.utc),
@@ -411,7 +413,6 @@ async def process_batch(
                     set_={
                         "title": result.title,
                         "summary": result.summary,
-                        "raw_text": result.raw_text,
                         "embedding": result.embedding,
                         "status": "indexed",
                         "indexed_at": datetime.now(timezone.utc),

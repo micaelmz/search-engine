@@ -67,7 +67,7 @@ crawler_light.py pega item da fila (FOR UPDATE SKIP LOCKED)
     ↓
 GET httpx → BeautifulSoup → extrai título, texto, links
     ↓
-GET embedding via Ollama (nomic-embed-text)
+gera summary (primeiros 1000 caracteres)
     ↓
 INSERT em pages + page_links
     ↓

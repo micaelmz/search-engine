@@ -11,7 +11,6 @@ class Page(Base):
     domain = Column(Text, nullable=False)
     title = Column(Text)
     summary = Column(Text)
-    raw_text = Column(Text)
     embedding = Column(Vector(768))
     language = Column(Text)
     status = Column(Text, default="pending")

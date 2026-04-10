@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     DATABASE_URL, EMBEDDING_API_URL, EMBEDDING_API_KEY,
     EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
-    REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE
+    REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE, EMBEDDING_ENABLED
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 
@@ -57,13 +57,13 @@ def get_domain(url: str) -> str:
 def random_ua() -> str:
     return random.choice(USER_AGENTS)
 
-def extract_text(soup: BeautifulSoup) -> tuple[str | None, str | None, str]:
+def extract_text(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     title = soup.title.string.strip() if soup.title and soup.title.string else None
     relevant_tags = soup.find_all(["h1", "h2", "h3", "p", "li"])
-    raw_text = " ".join(t.get_text(separator=" ", strip=True) for t in relevant_tags)
-    raw_text = " ".join(raw_text.split())
-    summary = raw_text[:500] if raw_text else None
-    return title, summary, raw_text
+    content_text = " ".join(t.get_text(separator=" ", strip=True) for t in relevant_tags)
+    content_text = " ".join(content_text.split())
+    summary = content_text[:1000] if content_text else None
+    return title, summary
 
 def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     links = []
@@ -194,25 +194,28 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
         html = page.content()
         soup = BeautifulSoup(html, "lxml")
 
-        title, summary, raw_text = extract_text(soup)
+        title, summary = extract_text(soup)
         links = extract_links(soup, url)
 
-        if not raw_text:
+        if not summary:
             log_warn(f"Sem conteúdo mesmo com Playwright: {url}")
             return False
 
         log_dim(f"  título: {title}")
         log_dim(f"  links encontrados: {len(links)}")
 
-        embedding = get_embedding(raw_text)
-        log_ok(f"  embedding: {'sim' if embedding else 'não'}")
+        embedding = None
+        if EMBEDDING_ENABLED:
+            embedding = get_embedding(summary)
+            log_ok(f"  embedding: {'sim' if embedding else 'não'}")
+        else:
+            log_dim("  embedding desativado")
 
         stmt = insert(Page.__table__).values(
             url=url,
             domain=domain,
             title=title,
             summary=summary,
-            raw_text=raw_text,
             embedding=embedding,
             status="indexed",
             indexed_at=datetime.now(timezone.utc),
@@ -222,7 +225,6 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
             set_={
                 "title": title,
                 "summary": summary,
-                "raw_text": raw_text,
                 "embedding": embedding,
                 "status": "indexed",
                 "indexed_at": datetime.now(timezone.utc),
