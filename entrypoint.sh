@@ -25,6 +25,21 @@ echo ""
 CONCURRENT_REQUESTS=${CONCURRENT_REQUESTS:-${CRAWLER_CONCURRENCY:-20}}
 CRAWLER_BATCH_SIZE=${CRAWLER_BATCH_SIZE:-$((CONCURRENT_REQUESTS * 2))}
 PLAYWRIGHT_WORKERS=${PLAYWRIGHT_WORKERS:-1}
+CRAWLER_VERBOSE_RAW=${CRAWLER_VERBOSE:-false}
+
+case "${CRAWLER_VERBOSE_RAW,,}" in
+  1|true|yes|on)
+    CRAWLER_VERBOSE=true
+    ;;
+  *)
+    CRAWLER_VERBOSE=false
+    ;;
+esac
+
+VERBOSE_ARGS=()
+if [ "$CRAWLER_VERBOSE" = "true" ]; then
+  VERBOSE_ARGS+=("--verbose")
+fi
 
 # Compatibilidade com config.py (fallback legado)
 export CRAWLER_CONCURRENCY="$CONCURRENT_REQUESTS"
@@ -35,6 +50,7 @@ echo "   Worker leve async (httpx):  1"
 echo "   Concurrent requests:        $CONCURRENT_REQUESTS"
 echo "   Batch size:                 $CRAWLER_BATCH_SIZE"
 echo "   Workers Playwright:         $PLAYWRIGHT_WORKERS"
+echo "   Verbose logs:               $CRAWLER_VERBOSE"
 echo "   Max depth:                  ${MAX_DEPTH:-3}"
 echo "   Delay por domínio:          ${CRAWL_DELAY_MS:-1000}ms"
 echo ""
@@ -42,7 +58,7 @@ echo ""
 # ── Sobe workers leves ────────────────────────────────────────────────────────
 
 echo "🚀 Subindo 1 worker leve async..."
-python crawler_light.py 2>&1 | sed "s/^/[light-1] /" &
+python crawler_light.py "${VERBOSE_ARGS[@]}" 2>&1 | sed "s/^/[light-1] /" &
 echo "   ↳ light-worker-1 PID=$!"
 
 # ── Sobe workers Playwright ───────────────────────────────────────────────────
@@ -50,7 +66,7 @@ echo "   ↳ light-worker-1 PID=$!"
 echo ""
 echo "🎭 Subindo $PLAYWRIGHT_WORKERS workers Playwright..."
 for i in $(seq 1 $PLAYWRIGHT_WORKERS); do
-  python crawler_playwright.py 2>&1 | sed "s/^/[playwright-$i] /" &
+  python crawler_playwright.py "${VERBOSE_ARGS[@]}" 2>&1 | sed "s/^/[playwright-$i] /" &
   echo "   ↳ playwright-worker-$i PID=$!"
   sleep 1
 done

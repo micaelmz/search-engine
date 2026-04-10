@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import random
+import argparse
 import httpx
 import logging
 from datetime import datetime, timezone
@@ -30,12 +31,32 @@ from models import Page, PageLink, CrawlerQueue, DomainRule
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
+def env_truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_runtime_options() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Ativa logs detalhados (inclui logs por URL e debug).",
+    )
+    return parser.parse_args()
+
+
+ARGS = parse_runtime_options()
+VERBOSE = ARGS.verbose or env_truthy(os.getenv("CRAWLER_VERBOSE"))
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if VERBOSE else logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("crawler.playwright")
+
+for noisy_logger in ("httpx", "httpcore", "urllib3", "playwright", "asyncio"):
+    logging.getLogger(noisy_logger).setLevel(logging.INFO if VERBOSE else logging.WARNING)
 
 MAGENTA = "\033[95m"
 GREEN   = "\033[92m"
@@ -49,6 +70,9 @@ def log_ok(msg):    log.info(f"{GREEN}✓ {msg}{RESET}")
 def log_warn(msg):  log.warning(f"{YELLOW}⚠ {msg}{RESET}")
 def log_err(msg):   log.error(f"{RED}✗ {msg}{RESET}")
 def log_dim(msg):   log.debug(f"{GRAY}{msg}{RESET}")
+def log_verbose(msg):
+    if VERBOSE:
+        log.info(f"{MAGENTA}{msg}{RESET}")
 
 # ── Helpers (mesmos do crawler leve) ─────────────────────────────────────────
 
@@ -215,7 +239,7 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
     time.sleep(delay)
 
     try:
-        log_info(f"[Playwright][depth={depth}] {url}")
+        log_verbose(f"[Playwright][depth={depth}] {url}")
 
         page.set_extra_http_headers({
             "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
@@ -245,7 +269,7 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
         embedding = None
         if EMBEDDING_ENABLED:
             embedding = get_embedding(summary)
-            log_ok(f"  embedding: {'sim' if embedding else 'não'}")
+            log_dim(f"  embedding: {'sim' if embedding else 'não'}")
         else:
             log_dim("  embedding desativado")
 
@@ -279,7 +303,7 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
         external_links_count, internal_links_count = enqueue_links(session, links, depth, url)
         session.commit()
 
-        log_ok(
+        log_dim(
             "  indexado → "
             f"{external_links_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
             f"{internal_links_count} internos (prio {INTERNAL_LINK_PRIORITY})"
@@ -297,6 +321,7 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
 
 def main():
     log_info("🎭 Crawler Playwright iniciando...")
+    log_info(f"Verbose: {'ON' if VERBOSE else 'OFF'} (env CRAWLER_VERBOSE / --verbose)")
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
     with sync_playwright() as p:

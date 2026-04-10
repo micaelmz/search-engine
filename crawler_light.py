@@ -7,6 +7,7 @@ import sys
 import os
 import asyncio
 import random
+import argparse
 import httpx
 import logging
 from dataclasses import dataclass
@@ -30,12 +31,32 @@ from models import Page, PageLink, CrawlerQueue, CrawlerSeed, DomainRule
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
+def env_truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_runtime_options() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Ativa logs detalhados (inclui logs por URL e debug).",
+    )
+    return parser.parse_args()
+
+
+ARGS = parse_runtime_options()
+VERBOSE = ARGS.verbose or env_truthy(os.getenv("CRAWLER_VERBOSE"))
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if VERBOSE else logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("crawler.light")
+
+for noisy_logger in ("httpx", "httpcore", "urllib3", "asyncio"):
+    logging.getLogger(noisy_logger).setLevel(logging.INFO if VERBOSE else logging.WARNING)
 
 CYAN   = "\033[96m"
 GREEN  = "\033[92m"
@@ -49,6 +70,9 @@ def log_ok(msg):      log.info(f"{GREEN}✓ {msg}{RESET}")
 def log_warn(msg):    log.warning(f"{YELLOW}⚠ {msg}{RESET}")
 def log_err(msg):     log.error(f"{RED}✗ {msg}{RESET}")
 def log_dim(msg):     log.debug(f"{GRAY}{msg}{RESET}")
+def log_verbose(msg):
+    if VERBOSE:
+        log.info(f"{CYAN}{msg}{RESET}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -480,13 +504,15 @@ async def process_batch(
     results = await asyncio.gather(*tasks)
 
     with Session(engine) as session:
+        success_count = 0
+        failed_count = 0
         for result in results:
             if result.ok:
-                log_info(f"[depth={result.depth}] {result.url}")
+                log_verbose(f"[depth={result.depth}] {result.url}")
                 log_dim(f"  título: {result.title}")
                 log_dim(f"  links encontrados: {len(result.links or [])}")
                 if EMBEDDING_ENABLED:
-                    log_ok(f"  embedding gerado: {'sim' if result.embedding else 'não'}")
+                    log_dim(f"  embedding gerado: {'sim' if result.embedding else 'não'}")
                 else:
                     log_dim("  embedding desativado")
 
@@ -526,11 +552,12 @@ async def process_batch(
                 )
                 mark_done(session, result.item_id)
                 external_count, internal_count = external_links_count
-                log_ok(
+                log_dim(
                     "  indexado com sucesso → "
                     f"{external_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
                     f"{internal_count} internos (prio {INTERNAL_LINK_PRIORITY})"
                 )
+                success_count += 1
             else:
                 if result.error == "dominio_bloqueado":
                     log_warn(f"Domínio bloqueado: {result.domain}")
@@ -552,6 +579,13 @@ async def process_batch(
                     mark_for_js_retry(session, result.item_id)
                 else:
                     mark_failed(session, result.item_id, needs_js=False)
+                failed_count += 1
+
+        if success_count or failed_count:
+            log_info(
+                "Resumo do lote: "
+                f"{success_count} indexadas, {failed_count} falhas"
+            )
 
         session.commit()
 
@@ -559,6 +593,7 @@ async def process_batch(
 
 async def async_main():
     log_info("🕷  Crawler leve (httpx) iniciando...")
+    log_info(f"Verbose: {'ON' if VERBOSE else 'OFF'} (env CRAWLER_VERBOSE / --verbose)")
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     empty_count = 0
     empty_sleep_seconds = 10
