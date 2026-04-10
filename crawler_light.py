@@ -25,7 +25,7 @@ from config import (
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE,
     CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE, EMBEDDING_ENABLED
 )
-from models import Page, PageLink, CrawlerQueue, DomainRule
+from models import Page, PageLink, CrawlerQueue, CrawlerSeed, DomainRule
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -238,6 +238,51 @@ def mark_for_js_retry(session: Session, item_id: int):
             attempts=CrawlerQueue.attempts + 1,
         )
     )
+
+
+def reactivate_seeds(engine) -> int:
+    """Reinsere/reativa seeds na fila quando o crawler fica sem trabalho."""
+    with Session(engine) as session:
+        seeds = session.execute(
+            select(CrawlerSeed.url, CrawlerSeed.priority)
+        ).all()
+
+        queue_rows = []
+        for seed_url, seed_priority in seeds:
+            domain = get_domain(seed_url)
+            if not domain:
+                continue
+            queue_rows.append(
+                {
+                    "url": seed_url,
+                    "domain": domain,
+                    "priority": seed_priority or 0,
+                    "depth": 0,
+                    "status": "pending",
+                    "needs_js": False,
+                    "queued_at": datetime.now(timezone.utc),
+                }
+            )
+
+        if queue_rows:
+            stmt = insert(CrawlerQueue.__table__).values(queue_rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["url"],
+                set_={
+                    "status": "pending",
+                    "depth": 0,
+                    "needs_js": False,
+                    "priority": stmt.excluded.priority,
+                    "queued_at": func.now(),
+                }
+            )
+            session.execute(stmt)
+            session.commit()
+
+        pending_count = session.execute(
+            select(func.count()).select_from(CrawlerQueue).where(CrawlerQueue.status == "pending")
+        ).scalar_one()
+        return pending_count
 
 def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> int:
     if depth >= MAX_DEPTH:
@@ -479,6 +524,9 @@ async def process_batch(
 async def async_main():
     log_info("🕷  Crawler leve (httpx) iniciando...")
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    empty_count = 0
+    empty_sleep_seconds = 10
+    empty_reactivate_threshold = 6  # 6 * 10s = 60s
 
     log_info(f"Concorrência async: {CRAWLER_CONCURRENCY} | Lote: {CRAWLER_BATCH_SIZE}")
     limits = httpx.Limits(
@@ -494,9 +542,22 @@ async def async_main():
                     items = claim_next_batch(session, CRAWLER_BATCH_SIZE)
 
                 if not items:
+                    empty_count += 1
+                    if empty_count >= empty_reactivate_threshold:
+                        log_warn("Fila vazia por ~1 min. Reativando seeds...")
+                        pending_count = await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            reactivate_seeds,
+                            engine,
+                        )
+                        log_info(f"Seeds reativadas. Itens pendentes na fila: {pending_count}")
+                        empty_count = 0
+
                     log_warn("Fila vazia. Aguardando 10s...")
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(empty_sleep_seconds)
                     continue
+
+                empty_count = 0
 
                 log_info(f"\n{'─'*60}")
                 log_info(f"Processando lote com {len(items)} URLs")
