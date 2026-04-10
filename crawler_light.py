@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-from sqlalchemy import create_engine, select, update, func
+from sqlalchemy import create_engine, select, update, func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 
@@ -162,7 +162,10 @@ class CrawlResult:
 def claim_next_batch(session: Session, batch_size: int) -> list[QueueItem]:
     rows = session.execute(
         select(CrawlerQueue)
-        .where(CrawlerQueue.status == "pending")
+        .where(
+            CrawlerQueue.status == "pending",
+            or_(CrawlerQueue.needs_js.is_(False), CrawlerQueue.needs_js.is_(None)),
+        )
         .order_by(
             CrawlerQueue.priority.desc(),
             CrawlerQueue.queued_at.asc(),
@@ -222,6 +225,18 @@ def mark_failed(session: Session, item_id: int, needs_js: bool = False):
         update(CrawlerQueue)
         .where(CrawlerQueue.id == item_id)
         .values(**values)
+    )
+
+
+def mark_for_js_retry(session: Session, item_id: int):
+    session.execute(
+        update(CrawlerQueue)
+        .where(CrawlerQueue.id == item_id)
+        .values(
+            status="pending",
+            needs_js=True,
+            attempts=CrawlerQueue.attempts + 1,
+        )
     )
 
 def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> int:
@@ -452,7 +467,10 @@ async def process_batch(
                 else:
                     log_err(f"Erro ao crawlear {result.url}: {result.error}")
 
-                mark_failed(session, result.item_id, needs_js=result.needs_js)
+                if result.needs_js:
+                    mark_for_js_retry(session, result.item_id)
+                else:
+                    mark_failed(session, result.item_id, needs_js=False)
 
         session.commit()
 

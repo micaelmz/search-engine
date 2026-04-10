@@ -26,6 +26,7 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 MAX_LINKS_PER_DOMAIN_PER_PAGE = int(os.getenv("MAX_LINKS_PER_DOMAIN_PER_PAGE", "3"))
 CRAWLER_CONCURRENCY = int(os.getenv("CONCURRENT_REQUESTS", os.getenv("CRAWLER_CONCURRENCY", "20")))
 CRAWLER_BATCH_SIZE = int(os.getenv("CRAWLER_BATCH_SIZE", str(max(40, CRAWLER_CONCURRENCY * 2))))
+PLAYWRIGHT_FALLBACK_TO_PENDING = os.getenv("PLAYWRIGHT_FALLBACK_TO_PENDING", "false").lower() == "true"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",

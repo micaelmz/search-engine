@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     DATABASE_URL, EMBEDDING_API_URL, EMBEDDING_API_KEY,
     EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
-    REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE, EMBEDDING_ENABLED
+    REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE, EMBEDDING_ENABLED,
+    PLAYWRIGHT_FALLBACK_TO_PENDING
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 
@@ -280,9 +281,9 @@ def main():
 
         while True:
             with Session(engine) as session:
-                # Tenta pegar item que precisa de JS, senão pega qualquer pending
+                # Por padrão, Playwright foca apenas no backlog needs_js.
                 item = next_item(session, js_only=True)
-                if not item:
+                if not item and PLAYWRIGHT_FALLBACK_TO_PENDING:
                     item = next_item(session, js_only=False)
 
                 if not item:
