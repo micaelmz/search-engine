@@ -24,6 +24,15 @@ psql -h $DB_HOST -U $DB_USER -d $DB_NAME -f seeds.sql
 python crawler_light.py
 ```
 
+Variáveis úteis para performance do crawler leve:
+```bash
+CRAWLER_CONCURRENCY=10   # quantas URLs processar em paralelo por processo
+CRAWLER_BATCH_SIZE=20    # quantas URLs pegar da fila por iteração
+```
+
+Com versão assíncrona, prefira menos processos e mais concorrência por processo.
+Exemplo inicial no Docker: `LIGHT_WORKERS=1` e `CRAWLER_CONCURRENCY=10`.
+
 **Crawler pesado (Playwright) — pra sites JS:**
 ```bash
 python crawler_playwright.py

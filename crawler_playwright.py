@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     DATABASE_URL, EMBEDDING_API_URL, EMBEDDING_API_KEY,
     EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
-    REQUEST_TIMEOUT, USER_AGENTS
+    REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 
@@ -51,7 +51,8 @@ def log_dim(msg):   log.debug(f"{GRAY}{msg}{RESET}")
 # ── Helpers (mesmos do crawler leve) ─────────────────────────────────────────
 
 def get_domain(url: str) -> str:
-    return urlparse(url).netloc
+    parsed = urlparse(url)
+    return (parsed.hostname or parsed.netloc).lower()
 
 def random_ua() -> str:
     return random.choice(USER_AGENTS)
@@ -97,10 +98,25 @@ def get_embedding(text: str) -> list[float] | None:
         return None
 
 def next_item(session: Session, js_only: bool = True):
+    pending_by_domain = (
+        select(
+            CrawlerQueue.domain.label("domain"),
+            func.count(CrawlerQueue.id).label("pending_count"),
+        )
+        .where(CrawlerQueue.status == "pending")
+        .group_by(CrawlerQueue.domain)
+        .subquery()
+    )
+
     query = (
         select(CrawlerQueue)
+        .join(pending_by_domain, pending_by_domain.c.domain == CrawlerQueue.domain)
         .where(CrawlerQueue.status == "pending")
-        .order_by(CrawlerQueue.priority.desc(), CrawlerQueue.queued_at.asc())
+        .order_by(
+            CrawlerQueue.priority.desc(),
+            pending_by_domain.c.pending_count.asc(),
+            CrawlerQueue.queued_at.asc(),
+        )
         .limit(1)
         .with_for_update(skip_locked=True)
     )
@@ -134,14 +150,19 @@ def mark_failed(session: Session, item_id: int):
 def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> int:
     if depth >= MAX_DEPTH:
         return 0
-    source_domain = get_domain(source_url).lower()
+    source_domain = get_domain(source_url)
     external_links = []
+    domain_counts: dict[str, int] = {}
     for target_url in links:
         domain = get_domain(target_url)
         if not domain:
             continue
-        if domain.lower() == source_domain:
+        if domain == source_domain:
             continue
+        seen_for_domain = domain_counts.get(domain, 0)
+        if seen_for_domain >= MAX_LINKS_PER_DOMAIN_PER_PAGE:
+            continue
+        domain_counts[domain] = seen_for_domain + 1
         external_links.append(target_url)
 
     new_links = [

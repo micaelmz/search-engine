@@ -22,6 +22,9 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 CRAWL_DELAY_MS = int(os.getenv("CRAWL_DELAY_MS", "1000"))
 MAX_DEPTH = int(os.getenv("MAX_DEPTH", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+MAX_LINKS_PER_DOMAIN_PER_PAGE = int(os.getenv("MAX_LINKS_PER_DOMAIN_PER_PAGE", "3"))
+CRAWLER_CONCURRENCY = int(os.getenv("CRAWLER_CONCURRENCY", "10"))
+CRAWLER_BATCH_SIZE = int(os.getenv("CRAWLER_BATCH_SIZE", "20"))
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",

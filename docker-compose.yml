@@ -28,6 +28,8 @@ services:
       CRAWL_DELAY_MS: ${CRAWL_DELAY_MS:-1000}
       MAX_DEPTH: ${MAX_DEPTH:-3}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-15}
+      CRAWLER_CONCURRENCY: ${CRAWLER_CONCURRENCY:-10}
+      CRAWLER_BATCH_SIZE: ${CRAWLER_BATCH_SIZE:-20}
 
     # Playwright precisa de memória extra por instância
     # 3 light (~150MB) + 1 playwright (~500MB) + overhead = ~1GB seguro
