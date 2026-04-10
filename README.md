@@ -36,7 +36,9 @@ MAX_INTERNAL_LINKS_PER_PAGE=10 # limite de links internos enfileirados por pági
 Balanceamento da fila:
 - Links externos entram com prioridade maior (padrão: `2`).
 - Links internos também entram na fila (padrão: `-1`) para manter domínios ricos ativos por mais tempo.
-- Quando uma URL já existe na fila/tabela, ela é reativada para `pending` com a prioridade do novo contexto (externo ou interno), evitando fila vazia por longos períodos.
+- Quando uma URL já existe na fila, apenas itens em `pending/failed` podem ser atualizados para `pending` novamente.
+- URLs já `done/processing` não são reativadas por novos links, evitando loop infinito de recrawl.
+- Exceção intencional: quando a fila inteira esgota, o crawler reativa somente as URLs da tabela `crawler_seeds` para iniciar um novo ciclo de coleta.
 
 Com versão assíncrona, o recomendado é 1 worker leve com concorrência interna alta.
 Exemplo inicial no Docker: `CONCURRENT_REQUESTS=20` e `CRAWLER_BATCH_SIZE=40`.
@@ -44,6 +46,11 @@ Exemplo inicial no Docker: `CONCURRENT_REQUESTS=20` e `CRAWLER_BATCH_SIZE=40`.
 **Crawler pesado (Playwright) — pra sites JS:**
 ```bash
 python crawler_playwright.py
+```
+
+Variável útil para estabilidade de RAM no Playwright:
+```bash
+PLAYWRIGHT_CONTEXT_RECYCLE_EVERY=25 # reinicia contexto/browser page a cada N URLs
 ```
 
 ## Estrutura

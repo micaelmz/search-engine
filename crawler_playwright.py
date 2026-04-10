@@ -25,7 +25,7 @@ from config import (
     EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE, EMBEDDING_ENABLED,
     PLAYWRIGHT_FALLBACK_TO_PENDING, MAX_INTERNAL_LINKS_PER_PAGE,
-    EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY,
+    EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY, PLAYWRIGHT_CONTEXT_RECYCLE_EVERY,
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 
@@ -216,11 +216,12 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
             set_={
                 "domain": stmt.excluded.domain,
                 "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
-                "depth": stmt.excluded.depth,
+                "depth": func.least(CrawlerQueue.depth, stmt.excluded.depth),
                 "status": "pending",
                 "needs_js": False,
                 "queued_at": func.now(),
             },
+            where=CrawlerQueue.status.in_(["pending", "failed"]),
         )
         session.execute(stmt)
     edges = [{"source_url": source_url, "target_url": u} for u in external_links + internal_links]
@@ -316,6 +317,36 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
     except Exception as e:
         log_err(f"Erro Playwright {url}: {e}")
         return False
+    finally:
+        # Navegar para about:blank ajuda a liberar memória de páginas JS pesadas.
+        try:
+            page.goto("about:blank", timeout=5000, wait_until="commit")
+        except Exception:
+            pass
+
+
+def create_playwright_page(browser):
+    context = browser.new_context(
+        user_agent=random_ua(),
+        viewport={"width": 1280, "height": 800},
+        locale="pt-BR",
+        service_workers="block",
+    )
+    page = context.new_page()
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    """)
+    return context, page
+
+
+def close_extra_pages(context, main_page):
+    for candidate in list(context.pages):
+        if candidate is main_page:
+            continue
+        try:
+            candidate.close()
+        except Exception:
+            pass
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
@@ -333,17 +364,8 @@ def main():
                 "--disable-blink-features=AutomationControlled",
             ]
         )
-        context = browser.new_context(
-            user_agent=random_ua(),
-            viewport={"width": 1280, "height": 800},
-            locale="pt-BR",
-        )
-        page = context.new_page()
-
-        # Anti-detecção básica
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        """)
+        context, page = create_playwright_page(browser)
+        processed_since_recycle = 0
 
         while True:
             with Session(engine) as session:
@@ -358,6 +380,7 @@ def main():
                     continue
 
                 log_info(f"\n{'─'*60}")
+                log_info(f"[Playwright][depth={item.depth}] {item.url}")
                 success = crawl_url_playwright(item.url, item.depth, page, session)
 
                 if success:
@@ -365,6 +388,24 @@ def main():
                 else:
                     # Marca como falho mas não bloqueia — o leve pode ter pegado
                     mark_failed(session, item.id)
+
+                close_extra_pages(context, page)
+                processed_since_recycle += 1
+                recycle_every = max(1, PLAYWRIGHT_CONTEXT_RECYCLE_EVERY)
+                if processed_since_recycle >= recycle_every:
+                    log_warn(
+                        f"Reciclando contexto Playwright após {processed_since_recycle} URLs para conter RAM..."
+                    )
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                    context, page = create_playwright_page(browser)
+                    processed_since_recycle = 0
 
         browser.close()
 

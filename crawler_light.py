@@ -268,6 +268,19 @@ def mark_for_js_retry(session: Session, item_id: int):
 def reactivate_seeds(engine) -> int:
     """Reinsere/reativa seeds na fila quando o crawler fica sem trabalho."""
     with Session(engine) as session:
+        active_count = session.execute(
+            select(func.count())
+            .select_from(CrawlerQueue)
+            .where(CrawlerQueue.status.in_(["pending", "processing"]))
+        ).scalar_one()
+        if active_count > 0:
+            pending_count = session.execute(
+                select(func.count())
+                .select_from(CrawlerQueue)
+                .where(CrawlerQueue.status == "pending")
+            ).scalar_one()
+            return pending_count
+
         seeds = session.execute(
             select(CrawlerSeed.url, CrawlerSeed.priority)
         ).all()
@@ -362,11 +375,12 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
             set_={
                 "domain": stmt.excluded.domain,
                 "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
-                "depth": stmt.excluded.depth,
+                "depth": func.least(CrawlerQueue.depth, stmt.excluded.depth),
                 "status": "pending",
                 "needs_js": False,
                 "queued_at": func.now(),
-            }
+            },
+            where=CrawlerQueue.status.in_(["pending", "failed"]),
         )
         session.execute(stmt)
 
