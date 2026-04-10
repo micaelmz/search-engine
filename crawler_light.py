@@ -162,23 +162,11 @@ class CrawlResult:
 
 
 def claim_next_batch(session: Session, batch_size: int) -> list[QueueItem]:
-    pending_by_domain = (
-        select(
-            CrawlerQueue.domain.label("domain"),
-            func.count(CrawlerQueue.id).label("pending_count"),
-        )
-        .where(CrawlerQueue.status == "pending")
-        .group_by(CrawlerQueue.domain)
-        .subquery()
-    )
-
     rows = session.execute(
         select(CrawlerQueue)
-        .join(pending_by_domain, pending_by_domain.c.domain == CrawlerQueue.domain)
         .where(CrawlerQueue.status == "pending")
         .order_by(
             CrawlerQueue.priority.desc(),
-            pending_by_domain.c.pending_count.asc(),
             CrawlerQueue.queued_at.asc(),
         )
         .limit(batch_size)

@@ -98,23 +98,11 @@ def get_embedding(text: str) -> list[float] | None:
         return None
 
 def next_item(session: Session, js_only: bool = True):
-    pending_by_domain = (
-        select(
-            CrawlerQueue.domain.label("domain"),
-            func.count(CrawlerQueue.id).label("pending_count"),
-        )
-        .where(CrawlerQueue.status == "pending")
-        .group_by(CrawlerQueue.domain)
-        .subquery()
-    )
-
     query = (
         select(CrawlerQueue)
-        .join(pending_by_domain, pending_by_domain.c.domain == CrawlerQueue.domain)
         .where(CrawlerQueue.status == "pending")
         .order_by(
             CrawlerQueue.priority.desc(),
-            pending_by_domain.c.pending_count.asc(),
             CrawlerQueue.queued_at.asc(),
         )
         .limit(1)
