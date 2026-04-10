@@ -28,7 +28,15 @@ Variáveis úteis para performance do crawler leve:
 ```bash
 CONCURRENT_REQUESTS=20   # quantas URLs processar em paralelo no worker async
 CRAWLER_BATCH_SIZE=40    # quantas URLs pegar da fila por iteração
+EXTERNAL_LINK_PRIORITY=2 # prioridade para links externos (novos domínios)
+INTERNAL_LINK_PRIORITY=-1 # prioridade para links internos (mesmo domínio)
+MAX_INTERNAL_LINKS_PER_PAGE=10 # limite de links internos enfileirados por página
 ```
+
+Balanceamento da fila:
+- Links externos entram com prioridade maior (padrão: `2`).
+- Links internos também entram na fila (padrão: `-1`) para manter domínios ricos ativos por mais tempo.
+- Quando uma URL já existe na fila/tabela, ela é reativada para `pending` com a prioridade do novo contexto (externo ou interno), evitando fila vazia por longos períodos.
 
 Com versão assíncrona, o recomendado é 1 worker leve com concorrência interna alta.
 Exemplo inicial no Docker: `CONCURRENT_REQUESTS=20` e `CRAWLER_BATCH_SIZE=40`.

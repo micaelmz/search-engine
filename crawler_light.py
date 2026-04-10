@@ -23,7 +23,8 @@ from config import (
     DATABASE_URL, EMBEDDING_API_URL, EMBEDDING_API_KEY,
     EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE,
-    CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE, EMBEDDING_ENABLED
+    CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE, EMBEDDING_ENABLED,
+    MAX_INTERNAL_LINKS_PER_PAGE, EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY,
 )
 from models import Page, PageLink, CrawlerQueue, CrawlerSeed, DomainRule
 
@@ -284,44 +285,74 @@ def reactivate_seeds(engine) -> int:
         ).scalar_one()
         return pending_count
 
-def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> int:
+def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> tuple[int, int]:
     if depth >= MAX_DEPTH:
-        return 0
+        return 0, 0
     source_domain = get_domain(source_url)
-    new_links = []
+
+    queue_rows = []
     external_links = []
+    internal_links = []
     domain_counts: dict[str, int] = {}
+    internal_count = 0
+
     for target_url in links:
         domain = get_domain(target_url)
         if not domain:
             continue
-        if domain == source_domain:
+        if target_url == source_url:
             continue
+        if domain == source_domain:
+            if internal_count >= MAX_INTERNAL_LINKS_PER_PAGE:
+                continue
+            internal_count += 1
+            internal_links.append(target_url)
+            queue_rows.append({
+                "url": target_url,
+                "domain": domain,
+                "priority": INTERNAL_LINK_PRIORITY,
+                "depth": depth + 1,
+                "status": "pending",
+                "needs_js": False,
+            })
+            continue
+
         seen_for_domain = domain_counts.get(domain, 0)
         if seen_for_domain >= MAX_LINKS_PER_DOMAIN_PER_PAGE:
             continue
         domain_counts[domain] = seen_for_domain + 1
         external_links.append(target_url)
-        new_links.append({
+        queue_rows.append({
             "url": target_url,
             "domain": domain,
-            "priority": 0,
+            "priority": EXTERNAL_LINK_PRIORITY,
             "depth": depth + 1,
             "status": "pending",
+            "needs_js": False,
         })
 
-    if new_links:
-        stmt = insert(CrawlerQueue.__table__).values(new_links)
-        stmt = stmt.on_conflict_do_nothing(index_elements=["url"])
+    if queue_rows:
+        stmt = insert(CrawlerQueue.__table__).values(queue_rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["url"],
+            set_={
+                "domain": stmt.excluded.domain,
+                "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
+                "depth": stmt.excluded.depth,
+                "status": "pending",
+                "needs_js": False,
+                "queued_at": func.now(),
+            }
+        )
         session.execute(stmt)
 
     # Salva arestas do grafo
-    edges = [{"source_url": source_url, "target_url": u} for u in external_links]
+    edges = [{"source_url": source_url, "target_url": u} for u in external_links + internal_links]
     if edges:
         stmt = insert(PageLink.__table__).values(edges)
         stmt = stmt.on_conflict_do_nothing()
         session.execute(stmt)
-    return len(external_links)
+    return len(external_links), len(internal_links)
 
 # ── Core ──────────────────────────────────────────────────────────────────────
 
@@ -494,7 +525,12 @@ async def process_batch(
                     result.url,
                 )
                 mark_done(session, result.item_id)
-                log_ok(f"  indexado com sucesso → {external_links_count} links externos enfileirados")
+                external_count, internal_count = external_links_count
+                log_ok(
+                    "  indexado com sucesso → "
+                    f"{external_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
+                    f"{internal_count} internos (prio {INTERNAL_LINK_PRIORITY})"
+                )
             else:
                 if result.error == "dominio_bloqueado":
                     log_warn(f"Domínio bloqueado: {result.domain}")

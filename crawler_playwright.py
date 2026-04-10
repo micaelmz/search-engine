@@ -23,7 +23,8 @@ from config import (
     DATABASE_URL, EMBEDDING_API_URL, EMBEDDING_API_KEY,
     EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE, EMBEDDING_ENABLED,
-    PLAYWRIGHT_FALLBACK_TO_PENDING
+    PLAYWRIGHT_FALLBACK_TO_PENDING, MAX_INTERNAL_LINKS_PER_PAGE,
+    EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY,
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 
@@ -136,17 +137,25 @@ def mark_failed(session: Session, item_id: int):
     )
     session.commit()
 
-def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> int:
+def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> tuple[int, int]:
     if depth >= MAX_DEPTH:
-        return 0
+        return 0, 0
     source_domain = get_domain(source_url)
     external_links = []
+    internal_links = []
     domain_counts: dict[str, int] = {}
+    internal_count = 0
     for target_url in links:
         domain = get_domain(target_url)
         if not domain:
             continue
+        if target_url == source_url:
+            continue
         if domain == source_domain:
+            if internal_count >= MAX_INTERNAL_LINKS_PER_PAGE:
+                continue
+            internal_count += 1
+            internal_links.append(target_url)
             continue
         seen_for_domain = domain_counts.get(domain, 0)
         if seen_for_domain >= MAX_LINKS_PER_DOMAIN_PER_PAGE:
@@ -155,20 +164,48 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
         external_links.append(target_url)
 
     new_links = [
-        {"url": u, "domain": get_domain(u), "priority": 0, "depth": depth + 1, "status": "pending"}
+        {
+            "url": u,
+            "domain": get_domain(u),
+            "priority": EXTERNAL_LINK_PRIORITY,
+            "depth": depth + 1,
+            "status": "pending",
+            "needs_js": False,
+        }
         for u in external_links
     ]
+    new_links.extend([
+        {
+            "url": u,
+            "domain": get_domain(u),
+            "priority": INTERNAL_LINK_PRIORITY,
+            "depth": depth + 1,
+            "status": "pending",
+            "needs_js": False,
+        }
+        for u in internal_links
+    ])
     if new_links:
         stmt = insert(CrawlerQueue.__table__).values(new_links)
-        stmt = stmt.on_conflict_do_nothing(index_elements=["url"])
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["url"],
+            set_={
+                "domain": stmt.excluded.domain,
+                "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
+                "depth": stmt.excluded.depth,
+                "status": "pending",
+                "needs_js": False,
+                "queued_at": func.now(),
+            },
+        )
         session.execute(stmt)
-    edges = [{"source_url": source_url, "target_url": u} for u in external_links]
+    edges = [{"source_url": source_url, "target_url": u} for u in external_links + internal_links]
     if edges:
         stmt = insert(PageLink.__table__).values(edges)
         stmt = stmt.on_conflict_do_nothing()
         session.execute(stmt)
     session.commit()
-    return len(external_links)
+    return len(external_links), len(internal_links)
 
 # ── Core Playwright ───────────────────────────────────────────────────────────
 
@@ -239,10 +276,14 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
             .values(last_crawled_at=func.now())
         )
 
-        external_links_count = enqueue_links(session, links, depth, url)
+        external_links_count, internal_links_count = enqueue_links(session, links, depth, url)
         session.commit()
 
-        log_ok(f"  indexado → {external_links_count} links externos enfileirados")
+        log_ok(
+            "  indexado → "
+            f"{external_links_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
+            f"{internal_links_count} internos (prio {INTERNAL_LINK_PRIORITY})"
+        )
         return True
 
     except PlaywrightTimeout:
