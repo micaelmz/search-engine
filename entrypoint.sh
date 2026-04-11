@@ -9,6 +9,9 @@ echo ""
 
 # ── Valida se o crawler deve rodar ───────────────────────────────────────────
 
+trap 'echo "🛑 Encerrando todos os workers e sub-processos..."; kill $(jobs -p) 2>/dev/null; sleep 2' EXIT SIGINT SIGTERM
+
+
 if [ "${CRAWLER_ENABLED:-false}" != "true" ]; then
   echo "⏸  CRAWLER_ENABLED != true — crawler pausado."
   echo "   Sete CRAWLER_ENABLED=true no env para iniciar."
