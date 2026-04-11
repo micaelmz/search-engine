@@ -560,6 +560,7 @@ async def crawl_url_async(
             soup = BeautifulSoup(r.text, "lxml")
             title, summary = extract_text(soup)
             links = extract_links(soup, item.url)
+            soup.decompose()
 
             if not summary:
                 return CrawlResult(

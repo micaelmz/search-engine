@@ -471,6 +471,7 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(PLAYWRIGHT_POST_RENDER_WAIT_MS)
                 html = page.content()
+                soup.decompose() # Libera a primeira soup
                 soup = BeautifulSoup(html, "lxml")
                 try:
                     rendered_text = page.locator("body").inner_text(timeout=PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS).strip()
@@ -482,6 +483,8 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
             except Exception:
                 log_page_step("retry de scroll falhou")
                 pass
+
+        soup.decompose()
 
         if not summary:
             log_warn(
@@ -667,19 +670,30 @@ def main():
                 recycle_every = max(1, PLAYWRIGHT_CONTEXT_RECYCLE_EVERY)
                 if processed_since_recycle >= recycle_every:
                     log_warn(
-                        f"Reciclando contexto Playwright após {processed_since_recycle} URLs para conter RAM..."
+                        f"Reciclando processo (Browser inteiro) Playwright após {processed_since_recycle} URLs para conter RAM..."
                     )
                     try:
                         page.close()
-                    except Exception:
-                        pass
+                    except Exception: pass
                     try:
                         context.close()
-                    except Exception:
-                        pass
+                    except Exception: pass
+                    try:
+                        browser.close()
+                    except Exception: pass
+
+                    # Recria o browser e o contexto do zero para limpar toda a RAM
+                    browser = p.chromium.launch(
+                        headless=True,
+                        args=[
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-blink-features=AutomationControlled",
+                        ]
+                    )
                     context, page = create_playwright_page(browser)
                     processed_since_recycle = 0
-                    log_ok("Contexto Playwright reciclado")
+                    log_ok("Processo Browser Playwright reciclado completamente")
 
         browser.close()
 
