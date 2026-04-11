@@ -12,7 +12,7 @@ import httpx
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode, unquote
 from bs4 import BeautifulSoup
 from sqlalchemy import create_engine, select, update, func, or_
 from sqlalchemy.orm import Session
@@ -26,6 +26,7 @@ from config import (
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE,
     CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE, EMBEDDING_ENABLED,
     MAX_INTERNAL_LINKS_PER_PAGE, EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY,
+    MAX_QUEUE_URL_LENGTH, EXCLUDED_QUEUE_DOMAINS,
 )
 from models import Page, PageLink, CrawlerQueue, CrawlerSeed, DomainRule
 
@@ -74,6 +75,130 @@ def log_verbose(msg):
     if VERBOSE:
         log.info(f"{CYAN}{msg}{RESET}")
 
+
+def sanitize_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    # Alguns sites retornam NUL (0x00), que quebra inserts/updates no Postgres.
+    return value.replace("\x00", "")
+
+
+def queue_snapshot(session: Session) -> tuple[int, int, int]:
+    pending_light = session.execute(
+        select(func.count()).select_from(CrawlerQueue).where(
+            CrawlerQueue.status == "pending",
+            or_(CrawlerQueue.needs_js.is_(False), CrawlerQueue.needs_js.is_(None)),
+        )
+    ).scalar_one()
+    pending_js = session.execute(
+        select(func.count()).select_from(CrawlerQueue).where(
+            CrawlerQueue.status == "pending",
+            CrawlerQueue.needs_js.is_(True),
+        )
+    ).scalar_one()
+    processing = session.execute(
+        select(func.count()).select_from(CrawlerQueue).where(CrawlerQueue.status == "processing")
+    ).scalar_one()
+    return pending_light, pending_js, processing
+
+
+TRACKING_QUERY_KEYS = {
+    "fbclid", "gclid", "dclid", "yclid", "msclkid", "mc_cid", "mc_eid",
+    "_hsenc", "_hsmi", "mkt_tok", "igshid", "ref_src",
+}
+
+TRACKING_HOSTS = {
+    "www.googleadservices.com",
+    "googleads.g.doubleclick.net",
+    "ad.doubleclick.net",
+}
+
+SOCIAL_SHARE_PATH_PREFIXES = {
+    ("facebook.com", "/dialog/share"),
+    ("facebook.com", "/sharer.php"),
+    ("twitter.com", "/intent/"),
+    ("x.com", "/intent/"),
+    ("linkedin.com", "/shareArticle"),
+    ("api.whatsapp.com", "/send"),
+}
+
+
+def is_excluded_domain(host: str) -> bool:
+    for blocked in EXCLUDED_QUEUE_DOMAINS:
+        if host == blocked or host.endswith(f".{blocked}"):
+            return True
+    return False
+
+
+def is_social_share_path(host: str, path: str) -> bool:
+    host_cmp = host.lower()
+    path_cmp = (path or "").lower()
+    for share_host, share_prefix in SOCIAL_SHARE_PATH_PREFIXES:
+        if (host_cmp == share_host or host_cmp.endswith(f".{share_host}")) and path_cmp.startswith(share_prefix):
+            return True
+    return False
+
+
+def normalize_discovered_url(raw_url: str, base_url: str) -> str | None:
+    absolute = sanitize_text(urljoin(base_url, raw_url))
+    if not absolute:
+        return None
+
+    parsed = urlparse(absolute)
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    host = (parsed.hostname or "").lower()
+    if is_excluded_domain(host):
+        return None
+    if host in TRACKING_HOSTS:
+        return None
+    if is_social_share_path(host, parsed.path):
+        return None
+
+    if host.endswith("youtube.com") and parsed.path == "/redirect":
+        target = None
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+            if key == "q" and value:
+                target = unquote(value)
+                break
+        if not target:
+            return None
+        parsed = urlparse(target)
+        if parsed.scheme not in ("http", "https"):
+            return None
+        host = (parsed.hostname or "").lower()
+        if is_excluded_domain(host):
+            return None
+        if host in TRACKING_HOSTS:
+            return None
+        if is_social_share_path(host, parsed.path):
+            return None
+
+    query_pairs = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+        key_lower = key.lower()
+        if key_lower.startswith("utm_") or key_lower in TRACKING_QUERY_KEYS:
+            continue
+        query_pairs.append((key, value))
+
+    normalized = urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc.lower(),
+            parsed.path or "/",
+            "",
+            urlencode(query_pairs, doseq=True),
+            "",
+        )
+    )
+    normalized = sanitize_text(normalized)
+    if not normalized:
+        return None
+    if len(normalized) > MAX_QUEUE_URL_LENGTH:
+        return None
+    return normalized
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_domain(url: str) -> str:
@@ -86,27 +211,27 @@ def random_ua() -> str:
 def extract_text(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     """Retorna (title, summary)"""
     title = soup.title.string.strip() if soup.title and soup.title.string else None
+    title = sanitize_text(title)
 
     # Texto relevante: H1, H2, H3, parágrafos
     relevant_tags = soup.find_all(["h1", "h2", "h3", "p", "li"])
     content_text = " ".join(t.get_text(separator=" ", strip=True) for t in relevant_tags)
     content_text = " ".join(content_text.split())  # colapsa espaços
 
-    summary = content_text[:1000] if content_text else None
+    summary = sanitize_text(content_text[:1000] if content_text else None)
 
     return title, summary
 
 def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     links = []
     for tag in soup.find_all("a", href=True):
-        href = tag["href"].strip()
+        href = sanitize_text(tag["href"].strip())
+        if not href:
+            continue
         if href.startswith(("#", "mailto:", "javascript:", "tel:")):
             continue
-        absolute = urljoin(base_url, href)
-        parsed = urlparse(absolute)
-        if parsed.scheme in ("http", "https"):
-            # Remove fragmento
-            clean = parsed._replace(fragment="").geturl()
+        clean = normalize_discovered_url(href, base_url)
+        if clean:
             links.append(clean)
     return list(set(links))
 
@@ -139,7 +264,7 @@ async def fetch_robots(domain: str, client: httpx.AsyncClient) -> str | None:
     try:
         r = await client.get(f"https://{domain}/robots.txt", timeout=5)
         if r.status_code == 200:
-            return r.text
+            return sanitize_text(r.text)
     except Exception:
         pass
     return None
@@ -495,7 +620,7 @@ async def process_batch(
                 session.execute(
                     update(DomainRule)
                     .where(DomainRule.domain == domain)
-                    .values(robots_txt=robots_txt)
+                    .values(robots_txt=sanitize_text(robots_txt))
                 )
             session.commit()
 
@@ -534,8 +659,8 @@ async def process_batch(
                 stmt = insert(Page.__table__).values(
                     url=result.url,
                     domain=result.domain,
-                    title=result.title,
-                    summary=result.summary,
+                    title=sanitize_text(result.title),
+                    summary=sanitize_text(result.summary),
                     embedding=result.embedding,
                     status="indexed",
                     indexed_at=datetime.now(timezone.utc),
@@ -543,8 +668,8 @@ async def process_batch(
                 stmt = stmt.on_conflict_do_update(
                     index_elements=["url"],
                     set_={
-                        "title": result.title,
-                        "summary": result.summary,
+                        "title": sanitize_text(result.title),
+                        "summary": sanitize_text(result.summary),
                         "embedding": result.embedding,
                         "status": "indexed",
                         "indexed_at": datetime.now(timezone.utc),
@@ -629,6 +754,15 @@ async def async_main():
 
                 if not items:
                     empty_count += 1
+                    with Session(engine) as session:
+                        pending_light, pending_js, processing = queue_snapshot(session)
+
+                    if pending_light > 0:
+                        log_warn(
+                            "Sem claim no lote, apesar de pending_light>0 "
+                            f"(pending_light={pending_light}, pending_js={pending_js}, processing={processing})"
+                        )
+
                     if empty_count >= empty_reactivate_threshold:
                         log_warn("Fila vazia por ~1 min. Reativando seeds...")
                         pending_count = await asyncio.get_running_loop().run_in_executor(
@@ -647,7 +781,11 @@ async def async_main():
 
                 log_info(f"\n{'─'*60}")
                 log_info(f"Processando lote com {len(items)} URLs")
-                await process_batch(engine, items, web_client, embedding_client)
+                try:
+                    await process_batch(engine, items, web_client, embedding_client)
+                except Exception as e:
+                    log_err(f"Falha ao processar lote de {len(items)} URLs: {type(e).__name__}: {e}")
+                    await asyncio.sleep(2)
 
 
 def main():

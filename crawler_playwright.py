@@ -11,7 +11,7 @@ import argparse
 import httpx
 import logging
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode, unquote
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from sqlalchemy import create_engine, select, update, func, or_
@@ -28,7 +28,7 @@ from config import (
     EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY, PLAYWRIGHT_CONTEXT_RECYCLE_EVERY,
     PLAYWRIGHT_NAVIGATION_TIMEOUT, PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS,
     PLAYWRIGHT_POST_RENDER_WAIT_MS, PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS,
-    PLAYWRIGHT_CRAWL_DELAY_MS,
+    PLAYWRIGHT_CRAWL_DELAY_MS, MAX_QUEUE_URL_LENGTH, EXCLUDED_QUEUE_DOMAINS,
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 
@@ -77,6 +77,111 @@ def log_verbose(msg):
     if VERBOSE:
         log.info(f"{MAGENTA}{msg}{RESET}")
 
+
+def sanitize_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    # Alguns sites retornam NUL (0x00), que quebra inserts/updates no Postgres.
+    return value.replace("\x00", "")
+
+
+TRACKING_QUERY_KEYS = {
+    "fbclid", "gclid", "dclid", "yclid", "msclkid", "mc_cid", "mc_eid",
+    "_hsenc", "_hsmi", "mkt_tok", "igshid", "ref_src",
+}
+
+TRACKING_HOSTS = {
+    "www.googleadservices.com",
+    "googleads.g.doubleclick.net",
+    "ad.doubleclick.net",
+}
+
+SOCIAL_SHARE_PATH_PREFIXES = {
+    ("facebook.com", "/dialog/share"),
+    ("facebook.com", "/sharer.php"),
+    ("twitter.com", "/intent/"),
+    ("x.com", "/intent/"),
+    ("linkedin.com", "/shareArticle"),
+    ("api.whatsapp.com", "/send"),
+}
+
+
+def is_excluded_domain(host: str) -> bool:
+    for blocked in EXCLUDED_QUEUE_DOMAINS:
+        if host == blocked or host.endswith(f".{blocked}"):
+            return True
+    return False
+
+
+def is_social_share_path(host: str, path: str) -> bool:
+    host_cmp = host.lower()
+    path_cmp = (path or "").lower()
+    for share_host, share_prefix in SOCIAL_SHARE_PATH_PREFIXES:
+        if (host_cmp == share_host or host_cmp.endswith(f".{share_host}")) and path_cmp.startswith(share_prefix):
+            return True
+    return False
+
+
+def normalize_discovered_url(raw_url: str, base_url: str) -> str | None:
+    absolute = sanitize_text(urljoin(base_url, raw_url))
+    if not absolute:
+        return None
+
+    parsed = urlparse(absolute)
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    host = (parsed.hostname or "").lower()
+    if is_excluded_domain(host):
+        return None
+    if host in TRACKING_HOSTS:
+        return None
+    if is_social_share_path(host, parsed.path):
+        return None
+
+    if host.endswith("youtube.com") and parsed.path == "/redirect":
+        target = None
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+            if key == "q" and value:
+                target = unquote(value)
+                break
+        if not target:
+            return None
+        parsed = urlparse(target)
+        if parsed.scheme not in ("http", "https"):
+            return None
+        host = (parsed.hostname or "").lower()
+        if is_excluded_domain(host):
+            return None
+        if host in TRACKING_HOSTS:
+            return None
+        if is_social_share_path(host, parsed.path):
+            return None
+
+    query_pairs = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+        key_lower = key.lower()
+        if key_lower.startswith("utm_") or key_lower in TRACKING_QUERY_KEYS:
+            continue
+        query_pairs.append((key, value))
+
+    normalized = urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc.lower(),
+            parsed.path or "/",
+            "",
+            urlencode(query_pairs, doseq=True),
+            "",
+        )
+    )
+    normalized = sanitize_text(normalized)
+    if not normalized:
+        return None
+    if len(normalized) > MAX_QUEUE_URL_LENGTH:
+        return None
+    return normalized
+
 def format_seconds(value: float) -> str:
     return f"{value:.2f}s"
 
@@ -98,7 +203,8 @@ def queue_snapshot(session: Session) -> tuple[int, int, int]:
 
 
 def log_page_step(message: str):
-    log.info(f"{MAGENTA}  ↳ {message}{RESET}")
+    if VERBOSE:
+        log.info(f"{MAGENTA}  ↳ {message}{RESET}")
 
 # ── Helpers (mesmos do crawler leve) ─────────────────────────────────────────
 
@@ -111,13 +217,14 @@ def random_ua() -> str:
 
 def extract_text(soup: BeautifulSoup, rendered_text: str | None = None) -> tuple[str | None, str | None]:
     title = soup.title.string.strip() if soup.title and soup.title.string else None
+    title = sanitize_text(title)
 
     if not title:
         meta_title = soup.find("meta", attrs={"property": "og:title"}) or soup.find(
             "meta", attrs={"name": "twitter:title"}
         )
         if meta_title and meta_title.get("content"):
-            title = meta_title["content"].strip()
+            title = sanitize_text(meta_title["content"].strip())
 
     text_chunks: list[str] = []
     seen_chunks: set[str] = set()
@@ -134,26 +241,26 @@ def extract_text(soup: BeautifulSoup, rendered_text: str | None = None) -> tuple
             "meta", attrs={"property": "og:description"}
         )
         if meta_description and meta_description.get("content"):
-            text_chunks.append(meta_description["content"].strip())
+            text_chunks.append(sanitize_text(meta_description["content"].strip()) or "")
 
     if not text_chunks and rendered_text:
-        text_chunks.append(" ".join(rendered_text.split()))
+        text_chunks.append(" ".join((sanitize_text(rendered_text) or "").split()))
 
     content_text = " ".join(text_chunks)
     content_text = " ".join(content_text.split())
-    summary = content_text[:1200] if content_text else None
+    summary = sanitize_text(content_text[:1200] if content_text else None)
     return title, summary
 
 def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     links = []
     for tag in soup.find_all("a", href=True):
-        href = tag["href"].strip()
+        href = sanitize_text(tag["href"].strip())
+        if not href:
+            continue
         if href.startswith(("#", "mailto:", "javascript:", "tel:")):
             continue
-        absolute = urljoin(base_url, href)
-        parsed = urlparse(absolute)
-        if parsed.scheme in ("http", "https"):
-            clean = parsed._replace(fragment="").geturl()
+        clean = normalize_discovered_url(href, base_url)
+        if clean:
             links.append(clean)
     return list(set(links))
 
@@ -295,7 +402,6 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
 
     try:
         start_time = time.perf_counter()
-        log_info(f"[Playwright][depth={depth}] {url}")
         log_page_step(f"domínio: {domain}")
         log_page_step(f"delay antes da navegação: {format_seconds(delay)}")
 
@@ -405,8 +511,8 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
         stmt = insert(Page.__table__).values(
             url=url,
             domain=domain,
-            title=title,
-            summary=summary,
+            title=sanitize_text(title),
+            summary=sanitize_text(summary),
             embedding=embedding,
             status="indexed",
             indexed_at=datetime.now(timezone.utc),
@@ -414,8 +520,8 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
         stmt = stmt.on_conflict_do_update(
             index_elements=["url"],
             set_={
-                "title": title,
-                "summary": summary,
+                "title": sanitize_text(title),
+                "summary": sanitize_text(summary),
                 "embedding": embedding,
                 "status": "indexed",
                 "indexed_at": datetime.now(timezone.utc),
@@ -443,9 +549,11 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
         return True
 
     except PlaywrightTimeout:
+        session.rollback()
         log_err(f"Timeout Playwright: {url} (timeout={PLAYWRIGHT_NAVIGATION_TIMEOUT}s)")
         return False
     except Exception as e:
+        session.rollback()
         log_err(f"Erro Playwright {url}: {type(e).__name__}: {e}")
         return False
     finally:

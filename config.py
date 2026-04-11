@@ -3,6 +3,11 @@ import os
 
 load_dotenv()
 
+
+def parse_csv_env(name: str, default: str = "") -> set[str]:
+    raw = os.getenv(name, default)
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
 # Database
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
@@ -28,10 +33,15 @@ PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NETWORK_IDLE_TIME
 PLAYWRIGHT_POST_RENDER_WAIT_MS = int(os.getenv("PLAYWRIGHT_POST_RENDER_WAIT_MS", "750"))
 PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS", "3000"))
 PLAYWRIGHT_CRAWL_DELAY_MS = int(os.getenv("PLAYWRIGHT_CRAWL_DELAY_MS", "250"))
+MAX_QUEUE_URL_LENGTH = int(os.getenv("MAX_QUEUE_URL_LENGTH", "1800"))
 MAX_LINKS_PER_DOMAIN_PER_PAGE = int(os.getenv("MAX_LINKS_PER_DOMAIN_PER_PAGE", "3"))
 MAX_INTERNAL_LINKS_PER_PAGE = int(os.getenv("MAX_INTERNAL_LINKS_PER_PAGE", "10"))
 EXTERNAL_LINK_PRIORITY = int(os.getenv("EXTERNAL_LINK_PRIORITY", "2"))
 INTERNAL_LINK_PRIORITY = int(os.getenv("INTERNAL_LINK_PRIORITY", "-1"))
+EXCLUDED_QUEUE_DOMAINS = parse_csv_env(
+    "EXCLUDED_QUEUE_DOMAINS",
+    "facebook.com,instagram.com,twitter.com,x.com,linkedin.com,api.whatsapp.com,wa.me,web.whatsapp.com",
+)
 CRAWLER_CONCURRENCY = int(os.getenv("CONCURRENT_REQUESTS", os.getenv("CRAWLER_CONCURRENCY", "20")))
 CRAWLER_BATCH_SIZE = int(os.getenv("CRAWLER_BATCH_SIZE", str(max(40, CRAWLER_CONCURRENCY * 2))))
 PLAYWRIGHT_FALLBACK_TO_PENDING = os.getenv("PLAYWRIGHT_FALLBACK_TO_PENDING", "false").lower() == "true"
