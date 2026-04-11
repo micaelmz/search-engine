@@ -30,6 +30,7 @@ services:
       MAX_DEPTH: ${MAX_DEPTH:-3}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-15}
       CRAWLER_CONCURRENCY: ${CRAWLER_CONCURRENCY:-20}
+      WATCHDOG_TIMEOUT_MINUTES: ${WATCHDOG_TIMEOUT_MINUTES:-5}
 
     # Playwright precisa de memória extra por instância
     # 1 light async + 1 playwright + overhead

@@ -29,8 +29,10 @@ from config import (
     PLAYWRIGHT_NAVIGATION_TIMEOUT, PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS,
     PLAYWRIGHT_POST_RENDER_WAIT_MS, PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS,
     PLAYWRIGHT_CRAWL_DELAY_MS, MAX_QUEUE_URL_LENGTH, EXCLUDED_QUEUE_DOMAINS,
+    WATCHDOG_TIMEOUT_MINUTES,
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
+from watchdog import get_heartbeat
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -633,7 +635,12 @@ def main():
         context, page = create_playwright_page(browser)
         processed_since_recycle = 0
 
+        heartbeat = get_heartbeat(WATCHDOG_TIMEOUT_MINUTES)
+        heartbeat.start()
+
         while True:
+            heartbeat.update()
+
             with Session(engine) as session:
                 # Por padrão, Playwright foca apenas no backlog needs_js.
                 item = next_item(session, js_only=True)

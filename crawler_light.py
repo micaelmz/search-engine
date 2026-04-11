@@ -26,9 +26,10 @@ from config import (
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE,
     CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE, EMBEDDING_ENABLED,
     MAX_INTERNAL_LINKS_PER_PAGE, EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY,
-    MAX_QUEUE_URL_LENGTH, EXCLUDED_QUEUE_DOMAINS,
+    MAX_QUEUE_URL_LENGTH, EXCLUDED_QUEUE_DOMAINS, WATCHDOG_TIMEOUT_MINUTES,
 )
 from models import Page, PageLink, CrawlerQueue, CrawlerSeed, DomainRule
+from watchdog import get_heartbeat
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -749,7 +750,12 @@ async def async_main():
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as web_client:
         async with httpx.AsyncClient(limits=limits, timeout=30) as embedding_client:
+            heartbeat = get_heartbeat(WATCHDOG_TIMEOUT_MINUTES)
+            heartbeat.start()
+            
             while True:
+                heartbeat.update()
+                
                 with Session(engine) as session:
                     items = claim_next_batch(session, CRAWLER_BATCH_SIZE)
 

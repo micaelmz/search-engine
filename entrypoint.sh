@@ -53,7 +53,10 @@ echo "   Workers Playwright:         $PLAYWRIGHT_WORKERS"
 echo "   Verbose logs:               $CRAWLER_VERBOSE"
 echo "   Max depth:                  ${MAX_DEPTH:-3}"
 echo "   Delay por domínio:          ${CRAWL_DELAY_MS:-1000}ms"
+echo "   Watchdog timeout:           ${WATCHDOG_TIMEOUT_MINUTES:-5} mins"
 echo ""
+
+export WATCHDOG_TIMEOUT_MINUTES="${WATCHDOG_TIMEOUT_MINUTES:-5}"
 
 # ── Sobe workers leves ────────────────────────────────────────────────────────
 
