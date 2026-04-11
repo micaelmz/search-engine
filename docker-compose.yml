@@ -44,3 +44,10 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
