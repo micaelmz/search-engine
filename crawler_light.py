@@ -324,6 +324,7 @@ def reactivate_seeds(engine) -> int:
 
 def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> tuple[int, int]:
     if depth >= MAX_DEPTH:
+        log_dim(f"  depth {depth} atingiu MAX_DEPTH={MAX_DEPTH}; nenhum link será enfileirado")
         return 0, 0
     source_domain = get_domain(source_url)
 
