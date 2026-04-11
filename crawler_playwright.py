@@ -77,6 +77,29 @@ def log_verbose(msg):
     if VERBOSE:
         log.info(f"{MAGENTA}{msg}{RESET}")
 
+def format_seconds(value: float) -> str:
+    return f"{value:.2f}s"
+
+
+def queue_snapshot(session: Session) -> tuple[int, int, int]:
+    pending = session.execute(
+        select(func.count()).select_from(CrawlerQueue).where(CrawlerQueue.status == "pending")
+    ).scalar_one()
+    pending_js = session.execute(
+        select(func.count()).select_from(CrawlerQueue).where(
+            CrawlerQueue.status == "pending",
+            CrawlerQueue.needs_js.is_(True),
+        )
+    ).scalar_one()
+    processing = session.execute(
+        select(func.count()).select_from(CrawlerQueue).where(CrawlerQueue.status == "processing")
+    ).scalar_one()
+    return pending, pending_js, processing
+
+
+def log_page_step(message: str):
+    log.info(f"{MAGENTA}  ↳ {message}{RESET}")
+
 # ── Helpers (mesmos do crawler leve) ─────────────────────────────────────────
 
 def get_domain(url: str) -> str:
@@ -270,40 +293,73 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
     time.sleep(delay)
 
     try:
-        log_verbose(f"[Playwright][depth={depth}] {url}")
+        start_time = time.perf_counter()
+        log_info(f"[Playwright][depth={depth}] {url}")
+        log_page_step(f"domínio: {domain}")
+        log_page_step(f"delay antes da navegação: {format_seconds(delay)}")
 
         page.set_extra_http_headers({
             "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
         })
 
-        page.goto(url, timeout=PLAYWRIGHT_NAVIGATION_TIMEOUT * 1000, wait_until="domcontentloaded")
+        nav_start = time.perf_counter()
+        log_page_step(
+            "navegando com "
+            f"timeout={PLAYWRIGHT_NAVIGATION_TIMEOUT}s / "
+            f"networkidle={PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS}ms"
+        )
+        response = page.goto(url, timeout=PLAYWRIGHT_NAVIGATION_TIMEOUT * 1000, wait_until="domcontentloaded")
+        nav_elapsed = time.perf_counter() - nav_start
+        status_code = response.status if response else "sem-resposta"
+        log_page_step(f"navegação ok em {format_seconds(nav_elapsed)} (HTTP {status_code})")
 
         # Aguarda conteúdo renderizar
+        idle_wait = False
         try:
+            idle_start = time.perf_counter()
             page.wait_for_load_state("networkidle", timeout=PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS)
+            idle_wait = True
+            log_page_step(f"networkidle ok em {format_seconds(time.perf_counter() - idle_start)}")
         except PlaywrightTimeout:
-            pass  # Não crítico, continua com o que tem
+            log_page_step("networkidle atingiu timeout; seguindo com o HTML disponível")
 
         try:
+            render_wait_start = time.perf_counter()
             page.wait_for_timeout(PLAYWRIGHT_POST_RENDER_WAIT_MS)
+            log_page_step(f"espera pós-render {format_seconds(time.perf_counter() - render_wait_start)}")
         except Exception:
             pass
 
         html = page.content()
         soup = BeautifulSoup(html, "lxml")
+        html_length = len(html)
+        log_page_step(f"HTML capturado: {html_length} bytes")
 
         rendered_text = None
         try:
+            body_text_start = time.perf_counter()
             rendered_text = page.locator("body").inner_text(timeout=PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS).strip()
+            log_page_step(
+                "body.inner_text ok em "
+                f"{format_seconds(time.perf_counter() - body_text_start)}"
+            )
         except PlaywrightTimeout:
+            log_page_step("body.inner_text excedeu timeout")
             rendered_text = None
         except Exception:
+            log_page_step("body.inner_text falhou; usando HTML bruto")
             rendered_text = None
 
         title, summary = extract_text(soup, rendered_text)
         links = extract_links(soup, url)
+        extraction_mode = "html"
+        if not summary and rendered_text:
+            extraction_mode = "body_text"
+        elif summary and rendered_text and summary in rendered_text:
+            extraction_mode = "body_text" if len(summary) >= 100 else "html"
 
         if not summary:
+            log_page_step("primeira extração sem conteúdo; tentando scroll + nova leitura")
             try:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(PLAYWRIGHT_POST_RENDER_WAIT_MS)
@@ -315,20 +371,33 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
                     rendered_text = None
                 title, summary = extract_text(soup, rendered_text)
                 links = extract_links(soup, url)
+                extraction_mode = "scroll_retry"
             except Exception:
+                log_page_step("retry de scroll falhou")
                 pass
 
         if not summary:
-            log_warn(f"Sem conteúdo mesmo com Playwright: {url}")
+            log_warn(
+                f"Sem conteúdo mesmo com Playwright: {url} "
+                f"(html={html_length} bytes, body={'sim' if rendered_text else 'não'})"
+            )
             return False
 
-        log_dim(f"  título: {title}")
+        elapsed = time.perf_counter() - start_time
+        log_page_step(f"extração concluída via {extraction_mode} em {format_seconds(elapsed)}")
+        log_dim(f"  título: {title or 'sem título'}")
+        log_dim(f"  resumo: {len(summary or '')} caracteres")
         log_dim(f"  links encontrados: {len(links)}")
 
         embedding = None
         if EMBEDDING_ENABLED:
+            emb_start = time.perf_counter()
             embedding = get_embedding(summary)
-            log_dim(f"  embedding: {'sim' if embedding else 'não'}")
+            log_dim(
+                "  embedding: "
+                f"{'sim' if embedding else 'não'} "
+                f"({format_seconds(time.perf_counter() - emb_start)})"
+            )
         else:
             log_dim("  embedding desativado")
 
@@ -367,13 +436,16 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
             f"{external_links_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
             f"{internal_links_count} internos (prio {INTERNAL_LINK_PRIORITY})"
         )
+        log_ok(
+            f"[Playwright] concluído em {format_seconds(time.perf_counter() - start_time)}"
+        )
         return True
 
     except PlaywrightTimeout:
-        log_err(f"Timeout Playwright: {url}")
+        log_err(f"Timeout Playwright: {url} (timeout={PLAYWRIGHT_NAVIGATION_TIMEOUT}s)")
         return False
     except Exception as e:
-        log_err(f"Erro Playwright {url}: {e}")
+        log_err(f"Erro Playwright {url}: {type(e).__name__}: {e}")
         return False
     finally:
         # Navegar para about:blank ajuda a liberar memória de páginas JS pesadas.
@@ -406,6 +478,20 @@ def create_playwright_page(browser):
     return context, page
 
 
+def log_startup(engine):
+    with Session(engine) as session:
+        pending, pending_js, processing = queue_snapshot(session)
+    log_info("Configuração Playwright:")
+    log_info(f"  workers são por processo via entrypoint.sh")
+    log_info(f"  fallback para fila pending: {'ON' if PLAYWRIGHT_FALLBACK_TO_PENDING else 'OFF'}")
+    log_info(f"  delay por URL: {PLAYWRIGHT_CRAWL_DELAY_MS}ms")
+    log_info(f"  timeout navegação: {PLAYWRIGHT_NAVIGATION_TIMEOUT}s")
+    log_info(f"  networkidle timeout: {PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS}ms")
+    log_info(f"  pós-render wait: {PLAYWRIGHT_POST_RENDER_WAIT_MS}ms")
+    log_info(f"  body.inner_text timeout: {PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS}ms")
+    log_info(f"  fila atual: pending={pending} | needs_js={pending_js} | processing={processing}")
+
+
 def close_extra_pages(context, main_page):
     for candidate in list(context.pages):
         if candidate is main_page:
@@ -421,6 +507,7 @@ def main():
     log_info("🎭 Crawler Playwright iniciando...")
     log_info(f"Verbose: {'ON' if VERBOSE else 'OFF'} (env CRAWLER_VERBOSE / --verbose)")
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    log_startup(engine)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -442,7 +529,15 @@ def main():
                     item = next_item(session, js_only=False)
 
                 if not item:
-                    log_warn("Fila vazia. Aguardando 10s...")
+                    pending, pending_js, processing = queue_snapshot(session)
+                    if pending or pending_js or processing:
+                        log_warn(
+                            "Sem item elegível para Playwright agora "
+                            f"(pending={pending}, needs_js={pending_js}, processing={processing}). "
+                            "Aguardando 10s..."
+                        )
+                    else:
+                        log_warn("Fila vazia. Aguardando 10s...")
                     time.sleep(10)
                     continue
 
@@ -451,9 +546,11 @@ def main():
                 success = crawl_url_playwright(item.url, item.depth, page, session)
 
                 if success:
+                    log_ok(f"Marcando done: {item.url}")
                     mark_done(session, item.id)
                 else:
                     # Marca como falho mas não bloqueia — o leve pode ter pegado
+                    log_warn(f"Marcando failed: {item.url}")
                     mark_failed(session, item.id)
 
                 close_extra_pages(context, page)
@@ -473,6 +570,7 @@ def main():
                         pass
                     context, page = create_playwright_page(browser)
                     processed_since_recycle = 0
+                    log_ok("Contexto Playwright reciclado")
 
         browser.close()
 
