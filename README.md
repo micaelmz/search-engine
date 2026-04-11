@@ -53,6 +53,21 @@ Variável útil para estabilidade de RAM no Playwright:
 PLAYWRIGHT_CONTEXT_RECYCLE_EVERY=25 # reinicia contexto/browser page a cada N URLs
 ```
 
+Variáveis úteis para tuning do Playwright:
+```bash
+PLAYWRIGHT_WORKERS=3                # 3 processos independentes de Playwright
+PLAYWRIGHT_CRAWL_DELAY_MS=250       # atraso por URL no crawler pesado
+PLAYWRIGHT_NAVIGATION_TIMEOUT=15    # timeout de navegação em segundos
+PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS=3000
+PLAYWRIGHT_POST_RENDER_WAIT_MS=750
+PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS=3000
+```
+
+Notas de operação:
+- `PLAYWRIGHT_WORKERS` sobe múltiplos processos, não threads. `PLAYWRIGHT_WORKERS=3` funciona no `entrypoint.sh` atual, desde que o container tenha memória suficiente.
+- A fila preserva `needs_js` quando seeds ou links são reativados. URLs marcadas como JS continuam indo para o Playwright.
+- O Playwright bloqueia imagens, mídia e fontes para renderizar texto mais rápido.
+
 ## Estrutura
 
 ```

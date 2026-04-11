@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-from sqlalchemy import create_engine, select, update, func
+from sqlalchemy import create_engine, select, update, func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 
@@ -26,6 +26,9 @@ from config import (
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE, EMBEDDING_ENABLED,
     PLAYWRIGHT_FALLBACK_TO_PENDING, MAX_INTERNAL_LINKS_PER_PAGE,
     EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY, PLAYWRIGHT_CONTEXT_RECYCLE_EVERY,
+    PLAYWRIGHT_NAVIGATION_TIMEOUT, PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS,
+    PLAYWRIGHT_POST_RENDER_WAIT_MS, PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS,
+    PLAYWRIGHT_CRAWL_DELAY_MS,
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 
@@ -83,12 +86,39 @@ def get_domain(url: str) -> str:
 def random_ua() -> str:
     return random.choice(USER_AGENTS)
 
-def extract_text(soup: BeautifulSoup) -> tuple[str | None, str | None]:
+def extract_text(soup: BeautifulSoup, rendered_text: str | None = None) -> tuple[str | None, str | None]:
     title = soup.title.string.strip() if soup.title and soup.title.string else None
-    relevant_tags = soup.find_all(["h1", "h2", "h3", "p", "li"])
-    content_text = " ".join(t.get_text(separator=" ", strip=True) for t in relevant_tags)
+
+    if not title:
+        meta_title = soup.find("meta", attrs={"property": "og:title"}) or soup.find(
+            "meta", attrs={"name": "twitter:title"}
+        )
+        if meta_title and meta_title.get("content"):
+            title = meta_title["content"].strip()
+
+    text_chunks: list[str] = []
+    seen_chunks: set[str] = set()
+
+    for selector in (["article", "main"], ["h1", "h2", "h3", "p", "li"]):
+        for tag in soup.find_all(selector):
+            text = " ".join(tag.get_text(separator=" ", strip=True).split())
+            if text and text not in seen_chunks:
+                seen_chunks.add(text)
+                text_chunks.append(text)
+
+    if not text_chunks:
+        meta_description = soup.find("meta", attrs={"name": "description"}) or soup.find(
+            "meta", attrs={"property": "og:description"}
+        )
+        if meta_description and meta_description.get("content"):
+            text_chunks.append(meta_description["content"].strip())
+
+    if not text_chunks and rendered_text:
+        text_chunks.append(" ".join(rendered_text.split()))
+
+    content_text = " ".join(text_chunks)
     content_text = " ".join(content_text.split())
-    summary = content_text[:1000] if content_text else None
+    summary = content_text[:1200] if content_text else None
     return title, summary
 
 def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
@@ -218,7 +248,7 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
                 "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
                 "depth": func.least(CrawlerQueue.depth, stmt.excluded.depth),
                 "status": "pending",
-                "needs_js": False,
+                "needs_js": or_(CrawlerQueue.needs_js.is_(True), stmt.excluded.needs_js.is_(True)),
                 "queued_at": func.now(),
             },
             where=CrawlerQueue.status.in_(["pending", "failed"]),
@@ -236,7 +266,7 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
 
 def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
     domain = get_domain(url)
-    delay = CRAWL_DELAY_MS / 1000
+    delay = PLAYWRIGHT_CRAWL_DELAY_MS / 1000
     time.sleep(delay)
 
     try:
@@ -246,19 +276,47 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
             "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
         })
 
-        page.goto(url, timeout=REQUEST_TIMEOUT * 1000, wait_until="domcontentloaded")
+        page.goto(url, timeout=PLAYWRIGHT_NAVIGATION_TIMEOUT * 1000, wait_until="domcontentloaded")
 
         # Aguarda conteúdo renderizar
         try:
-            page.wait_for_load_state("networkidle", timeout=5000)
+            page.wait_for_load_state("networkidle", timeout=PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS)
         except PlaywrightTimeout:
             pass  # Não crítico, continua com o que tem
+
+        try:
+            page.wait_for_timeout(PLAYWRIGHT_POST_RENDER_WAIT_MS)
+        except Exception:
+            pass
 
         html = page.content()
         soup = BeautifulSoup(html, "lxml")
 
-        title, summary = extract_text(soup)
+        rendered_text = None
+        try:
+            rendered_text = page.locator("body").inner_text(timeout=PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS).strip()
+        except PlaywrightTimeout:
+            rendered_text = None
+        except Exception:
+            rendered_text = None
+
+        title, summary = extract_text(soup, rendered_text)
         links = extract_links(soup, url)
+
+        if not summary:
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(PLAYWRIGHT_POST_RENDER_WAIT_MS)
+                html = page.content()
+                soup = BeautifulSoup(html, "lxml")
+                try:
+                    rendered_text = page.locator("body").inner_text(timeout=PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS).strip()
+                except Exception:
+                    rendered_text = None
+                title, summary = extract_text(soup, rendered_text)
+                links = extract_links(soup, url)
+            except Exception:
+                pass
 
         if not summary:
             log_warn(f"Sem conteúdo mesmo com Playwright: {url}")
@@ -332,7 +390,16 @@ def create_playwright_page(browser):
         locale="pt-BR",
         service_workers="block",
     )
+    def block_heavy_resources(route):
+        if route.request.resource_type in {"image", "media", "font"}:
+            route.abort()
+            return
+        route.continue_()
+
+    context.route("**/*", block_heavy_resources)
     page = context.new_page()
+    page.set_default_navigation_timeout(PLAYWRIGHT_NAVIGATION_TIMEOUT * 1000)
+    page.set_default_timeout(max(PLAYWRIGHT_NAVIGATION_TIMEOUT, 10) * 1000)
     page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     """)

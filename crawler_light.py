@@ -309,7 +309,7 @@ def reactivate_seeds(engine) -> int:
                 set_={
                     "status": "pending",
                     "depth": 0,
-                    "needs_js": False,
+                    "needs_js": or_(CrawlerQueue.needs_js.is_(True), stmt.excluded.needs_js.is_(True)),
                     "priority": stmt.excluded.priority,
                     "queued_at": func.now(),
                 }
@@ -377,7 +377,7 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
                 "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
                 "depth": func.least(CrawlerQueue.depth, stmt.excluded.depth),
                 "status": "pending",
-                "needs_js": False,
+                "needs_js": or_(CrawlerQueue.needs_js.is_(True), stmt.excluded.needs_js.is_(True)),
                 "queued_at": func.now(),
             },
             where=CrawlerQueue.status.in_(["pending", "failed"]),
