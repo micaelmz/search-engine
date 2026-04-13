@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode, unquote
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, SoupStrainer
 from sqlalchemy import create_engine, select, update, func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
@@ -21,12 +21,12 @@ from sqlalchemy.dialects.postgresql import insert
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    DATABASE_URL, EMBEDDING_API_URL, EMBEDDING_API_KEY,
-    EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
+    DATABASE_URL, CRAWL_DELAY_MS, MAX_DEPTH,
     REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE,
-    CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE, EMBEDDING_ENABLED,
+    CRAWLER_CONCURRENCY, CRAWLER_BATCH_SIZE,
     MAX_INTERNAL_LINKS_PER_PAGE, EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY,
     MAX_QUEUE_URL_LENGTH, EXCLUDED_QUEUE_DOMAINS, WATCHDOG_TIMEOUT_MINUTES,
+    MAX_PAGES_PER_DOMAIN,
 )
 from models import Page, PageLink, CrawlerQueue, CrawlerSeed, DomainRule
 from watchdog import get_heartbeat
@@ -108,7 +108,7 @@ TRACKING_QUERY_KEYS = {
     "_hsenc", "_hsmi", "mkt_tok", "igshid", "ref_src",
 }
 
-TRACKING_HOSTS = {
+TRACKING_HOSTS: set[str] = {
     "www.googleadservices.com",
     "googleads.g.doubleclick.net",
     "ad.doubleclick.net",
@@ -122,6 +122,54 @@ SOCIAL_SHARE_PATH_PREFIXES = {
     ("linkedin.com", "/shareArticle"),
     ("api.whatsapp.com", "/send"),
 }
+
+NOISE_SECTION_TAGS = {"nav", "footer", "aside", "header"}
+CONTENT_TEXT_TAGS = ("h1", "h2", "h3", "p", "li")
+
+# Parse somente nós úteis para reduzir custo/memória de DOM completo.
+CRAWL_SOUP_STRAINER = SoupStrainer(
+    name=["title", "meta", "main", "article", "div", "a", "h1", "h2", "h3", "p", "li", "nav", "footer", "aside", "header"]
+)
+
+
+def is_inside_noise_section(tag) -> bool:
+    parent = tag.parent
+    while parent is not None:
+        if parent.name in NOISE_SECTION_TAGS:
+            return True
+        parent = parent.parent
+    return False
+
+
+def get_content_roots(soup: BeautifulSoup) -> list:
+    roots = []
+    seen_ids = set()
+
+    for node in soup.find_all("main"):
+        node_id = id(node)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            roots.append(node)
+
+    for node in soup.find_all("article"):
+        node_id = id(node)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            roots.append(node)
+
+    for node in soup.find_all("div", id="content"):
+        node_id = id(node)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            roots.append(node)
+
+    for node in soup.find_all("div", attrs={"role": "main"}):
+        node_id = id(node)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            roots.append(node)
+
+    return roots if roots else [soup]
 
 
 def is_excluded_domain(host: str) -> bool:
@@ -210,14 +258,33 @@ def random_ua() -> str:
     return random.choice(USER_AGENTS)
 
 def extract_text(soup: BeautifulSoup) -> tuple[str | None, str | None]:
-    """Retorna (title, summary)"""
+    """Retorna (title, summary) com foco em conteúdo denso."""
     title = soup.title.string.strip() if soup.title and soup.title.string else None
     title = sanitize_text(title)
 
-    # Texto relevante: H1, H2, H3, parágrafos
-    relevant_tags = soup.find_all(["h1", "h2", "h3", "p", "li"])
-    content_text = " ".join(t.get_text(separator=" ", strip=True) for t in relevant_tags)
-    content_text = " ".join(content_text.split())  # colapsa espaços
+    chunks = []
+    seen = set()
+
+    for root in get_content_roots(soup):
+        for tag in root.find_all(CONTENT_TEXT_TAGS):
+            if is_inside_noise_section(tag):
+                continue
+            text = tag.get_text(separator=" ", strip=True)
+            if not text:
+                continue
+
+            # Remove itens curtos de menu/lista mantendo headings informativos.
+            min_len = 6 if tag.name in ("h1", "h2", "h3") else 30
+            if len(text) < min_len:
+                continue
+            if text in seen:
+                continue
+
+            seen.add(text)
+            chunks.append(text)
+
+    content_text = " ".join(chunks)
+    content_text = " ".join(content_text.split())
 
     summary = sanitize_text(content_text[:1000] if content_text else None)
 
@@ -225,7 +292,28 @@ def extract_text(soup: BeautifulSoup) -> tuple[str | None, str | None]:
 
 def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     links = []
+    roots = get_content_roots(soup)
+
+    for root in roots:
+        for tag in root.find_all("a", href=True):
+            if is_inside_noise_section(tag):
+                continue
+            href = sanitize_text(tag["href"].strip())
+            if not href:
+                continue
+            if href.startswith(("#", "mailto:", "javascript:", "tel:")):
+                continue
+            clean = normalize_discovered_url(href, base_url)
+            if clean:
+                links.append(clean)
+
+    if links:
+        return list(set(links))
+
+    # Fallback para páginas sem <main>/<article>/<div id=content>/<div role=main>.
     for tag in soup.find_all("a", href=True):
+        if is_inside_noise_section(tag):
+            continue
         href = sanitize_text(tag["href"].strip())
         if not href:
             continue
@@ -234,30 +322,8 @@ def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
         clean = normalize_discovered_url(href, base_url)
         if clean:
             links.append(clean)
+
     return list(set(links))
-
-# ── Embedding ─────────────────────────────────────────────────────────────────
-
-async def get_embedding(client: httpx.AsyncClient, text: str) -> list[float] | None:
-    if not text or not text.strip():
-        return None
-    try:
-        headers = {"Content-Type": "application/json"}
-        if EMBEDDING_API_KEY:
-            headers["Authorization"] = f"Bearer {EMBEDDING_API_KEY}"
-
-        r = await client.post(
-            EMBEDDING_API_URL,
-            json={"model": EMBEDDING_MODEL, "input": text[:4000]},
-            headers=headers,
-            timeout=30,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data["embeddings"][0]
-    except Exception as e:
-        log_warn(f"Embedding falhou: {e}")
-        return None
 
 # ── Robots.txt ────────────────────────────────────────────────────────────────
 
@@ -304,7 +370,6 @@ class CrawlResult:
     ok: bool
     title: str | None = None
     summary: str | None = None
-    embedding: list[float] | None = None
     links: list[str] | None = None
     needs_js: bool = False
     error: str | None = None
@@ -391,6 +456,20 @@ def mark_for_js_retry(session: Session, item_id: int):
     )
 
 
+def filter_domains_under_cap(session: Session, domains: set[str]) -> set[str]:
+    if not domains:
+        return set()
+
+    counts = dict(
+        session.execute(
+            select(Page.domain, func.count(Page.id))
+            .where(Page.domain.in_(domains))
+            .group_by(Page.domain)
+        ).all()
+    )
+    return {domain for domain in domains if counts.get(domain, 0) < MAX_PAGES_PER_DOMAIN}
+
+
 def reactivate_seeds(engine) -> int:
     """Reinsere/reativa seeds na fila quando o crawler fica sem trabalho."""
     with Session(engine) as session:
@@ -429,6 +508,13 @@ def reactivate_seeds(engine) -> int:
             )
 
         if queue_rows:
+            allowed_domains = filter_domains_under_cap(
+                session,
+                {row["domain"] for row in queue_rows},
+            )
+            queue_rows = [row for row in queue_rows if row["domain"] in allowed_domains]
+
+        if queue_rows:
             stmt = insert(CrawlerQueue.__table__).values(queue_rows)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["url"],
@@ -455,8 +541,8 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
     source_domain = get_domain(source_url)
 
     queue_rows = []
-    external_links = []
-    internal_links = []
+    external_links: list[tuple[str, str]] = []
+    internal_links: list[tuple[str, str]] = []
     domain_counts: dict[str, int] = {}
     internal_count = 0
 
@@ -470,7 +556,7 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
             if internal_count >= MAX_INTERNAL_LINKS_PER_PAGE:
                 continue
             internal_count += 1
-            internal_links.append(target_url)
+            internal_links.append((target_url, domain))
             queue_rows.append({
                 "url": target_url,
                 "domain": domain,
@@ -485,7 +571,7 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
         if seen_for_domain >= MAX_LINKS_PER_DOMAIN_PER_PAGE:
             continue
         domain_counts[domain] = seen_for_domain + 1
-        external_links.append(target_url)
+        external_links.append((target_url, domain))
         queue_rows.append({
             "url": target_url,
             "domain": domain,
@@ -494,6 +580,18 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
             "status": "pending",
             "needs_js": False,
         })
+
+    if queue_rows:
+        allowed_domains = filter_domains_under_cap(
+            session,
+            {row["domain"] for row in queue_rows},
+        )
+        if not allowed_domains:
+            return 0, 0
+
+        queue_rows = [row for row in queue_rows if row["domain"] in allowed_domains]
+        external_links = [item for item in external_links if item[1] in allowed_domains]
+        internal_links = [item for item in internal_links if item[1] in allowed_domains]
 
     if queue_rows:
         stmt = insert(CrawlerQueue.__table__).values(queue_rows)
@@ -512,7 +610,10 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
         session.execute(stmt)
 
     # Salva arestas do grafo
-    edges = [{"source_url": source_url, "target_url": u} for u in external_links + internal_links]
+    edges = [
+        {"source_url": source_url, "target_url": target_url}
+        for target_url, _domain in (external_links + internal_links)
+    ]
     if edges:
         stmt = insert(PageLink.__table__).values(edges)
         stmt = stmt.on_conflict_do_nothing()
@@ -525,7 +626,6 @@ async def crawl_url_async(
     item: QueueItem,
     rule: DomainRule,
     web_client: httpx.AsyncClient,
-    embedding_client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
 ) -> CrawlResult:
     async with sem:
@@ -558,7 +658,7 @@ async def crawl_url_async(
             if "text/html" not in content_type:
                 return CrawlResult(item_id=item.id, url=item.url, domain=item.domain, depth=item.depth, ok=False, error="nao_html")
 
-            soup = BeautifulSoup(r.text, "lxml")
+            soup = BeautifulSoup(r.text, "lxml", parse_only=CRAWL_SOUP_STRAINER)
             title, summary = extract_text(soup)
             links = extract_links(soup, item.url)
             soup.decompose()
@@ -574,9 +674,6 @@ async def crawl_url_async(
                     error="sem_conteudo",
                 )
 
-            embedding = None
-            if EMBEDDING_ENABLED:
-                embedding = await get_embedding(embedding_client, summary)
             return CrawlResult(
                 item_id=item.id,
                 url=item.url,
@@ -585,7 +682,6 @@ async def crawl_url_async(
                 ok=True,
                 title=title,
                 summary=summary,
-                embedding=embedding,
                 links=links,
             )
         except httpx.TimeoutException:
@@ -598,7 +694,6 @@ async def process_batch(
     engine,
     items: list[QueueItem],
     web_client: httpx.AsyncClient,
-    embedding_client: httpx.AsyncClient,
 ):
     if not items:
         return
@@ -638,7 +733,6 @@ async def process_batch(
             item=i,
             rule=rules.get(i.domain, DomainRule(domain=i.domain, crawl_delay_ms=CRAWL_DELAY_MS)),
             web_client=web_client,
-            embedding_client=embedding_client,
             sem=sem,
         )
         for i in items
@@ -653,17 +747,14 @@ async def process_batch(
                 log_verbose(f"[depth={result.depth}] {result.url}")
                 log_dim(f"  título: {result.title}")
                 log_dim(f"  links encontrados: {len(result.links or [])}")
-                if EMBEDDING_ENABLED:
-                    log_dim(f"  embedding gerado: {'sim' if result.embedding else 'não'}")
-                else:
-                    log_dim("  embedding desativado")
 
                 stmt = insert(Page.__table__).values(
                     url=result.url,
                     domain=result.domain,
                     title=sanitize_text(result.title),
                     summary=sanitize_text(result.summary),
-                    embedding=result.embedding,
+                    embedding=None,
+                    language=None,
                     status="indexed",
                     indexed_at=datetime.now(timezone.utc),
                 )
@@ -672,7 +763,8 @@ async def process_batch(
                     set_={
                         "title": sanitize_text(result.title),
                         "summary": sanitize_text(result.summary),
-                        "embedding": result.embedding,
+                        "embedding": None,
+                        "language": None,
                         "status": "indexed",
                         "indexed_at": datetime.now(timezone.utc),
                         "updated_at": datetime.now(timezone.utc),
@@ -749,50 +841,49 @@ async def async_main():
     timeout = httpx.Timeout(REQUEST_TIMEOUT)
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as web_client:
-        async with httpx.AsyncClient(limits=limits, timeout=30) as embedding_client:
-            heartbeat = get_heartbeat(WATCHDOG_TIMEOUT_MINUTES)
-            heartbeat.start()
-            
-            while True:
-                heartbeat.update()
-                
+        heartbeat = get_heartbeat(WATCHDOG_TIMEOUT_MINUTES)
+        heartbeat.start()
+
+        while True:
+            heartbeat.update()
+
+            with Session(engine) as session:
+                items = claim_next_batch(session, CRAWLER_BATCH_SIZE)
+
+            if not items:
+                empty_count += 1
                 with Session(engine) as session:
-                    items = claim_next_batch(session, CRAWLER_BATCH_SIZE)
+                    pending_light, pending_js, processing = queue_snapshot(session)
 
-                if not items:
-                    empty_count += 1
-                    with Session(engine) as session:
-                        pending_light, pending_js, processing = queue_snapshot(session)
+                if pending_light > 0:
+                    log_warn(
+                        "Sem claim no lote, apesar de pending_light>0 "
+                        f"(pending_light={pending_light}, pending_js={pending_js}, processing={processing})"
+                    )
 
-                    if pending_light > 0:
-                        log_warn(
-                            "Sem claim no lote, apesar de pending_light>0 "
-                            f"(pending_light={pending_light}, pending_js={pending_js}, processing={processing})"
-                        )
+                if empty_count >= empty_reactivate_threshold:
+                    log_warn("Fila vazia por ~1 min. Reativando seeds...")
+                    pending_count = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        reactivate_seeds,
+                        engine,
+                    )
+                    log_info(f"Seeds reativadas. Itens pendentes na fila: {pending_count}")
+                    empty_count = 0
 
-                    if empty_count >= empty_reactivate_threshold:
-                        log_warn("Fila vazia por ~1 min. Reativando seeds...")
-                        pending_count = await asyncio.get_running_loop().run_in_executor(
-                            None,
-                            reactivate_seeds,
-                            engine,
-                        )
-                        log_info(f"Seeds reativadas. Itens pendentes na fila: {pending_count}")
-                        empty_count = 0
+                log_warn("Fila vazia. Aguardando 10s...")
+                await asyncio.sleep(empty_sleep_seconds)
+                continue
 
-                    log_warn("Fila vazia. Aguardando 10s...")
-                    await asyncio.sleep(empty_sleep_seconds)
-                    continue
+            empty_count = 0
 
-                empty_count = 0
-
-                log_info(f"\n{'─'*60}")
-                log_info(f"Processando lote com {len(items)} URLs")
-                try:
-                    await process_batch(engine, items, web_client, embedding_client)
-                except Exception as e:
-                    log_err(f"Falha ao processar lote de {len(items)} URLs: {type(e).__name__}: {e}")
-                    await asyncio.sleep(2)
+            log_info(f"\n{'─'*60}")
+            log_info(f"Processando lote com {len(items)} URLs")
+            try:
+                await process_batch(engine, items, web_client)
+            except Exception as e:
+                log_err(f"Falha ao processar lote de {len(items)} URLs: {type(e).__name__}: {e}")
+                await asyncio.sleep(2)
 
 
 def main():

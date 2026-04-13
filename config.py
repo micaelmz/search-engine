@@ -38,9 +38,10 @@ MAX_LINKS_PER_DOMAIN_PER_PAGE = int(os.getenv("MAX_LINKS_PER_DOMAIN_PER_PAGE", "
 MAX_INTERNAL_LINKS_PER_PAGE = int(os.getenv("MAX_INTERNAL_LINKS_PER_PAGE", "10"))
 EXTERNAL_LINK_PRIORITY = int(os.getenv("EXTERNAL_LINK_PRIORITY", "2"))
 INTERNAL_LINK_PRIORITY = int(os.getenv("INTERNAL_LINK_PRIORITY", "-1"))
-EXCLUDED_QUEUE_DOMAINS = parse_csv_env(
+MAX_PAGES_PER_DOMAIN = int(os.getenv("MAX_PAGES_PER_DOMAIN", "30000"))
+EXCLUDED_QUEUE_DOMAINS: set[str] = parse_csv_env(
     "EXCLUDED_QUEUE_DOMAINS",
-    "facebook.com,instagram.com,twitter.com,x.com,linkedin.com,api.whatsapp.com,wa.me,web.whatsapp.com",
+    "facebook.com,instagram.com,twitter.com,x.com,linkedin.com,api.whatsapp.com,wa.me,web.whatsapp.com,github.com,youtube.com,youtu.be",
 )
 CRAWLER_CONCURRENCY = int(os.getenv("CONCURRENT_REQUESTS", os.getenv("CRAWLER_CONCURRENCY", "20")))
 CRAWLER_BATCH_SIZE = int(os.getenv("CRAWLER_BATCH_SIZE", str(max(40, CRAWLER_CONCURRENCY * 2))))

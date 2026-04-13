@@ -8,11 +8,10 @@ import os
 import time
 import random
 import argparse
-import httpx
 import logging
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode, unquote
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, SoupStrainer
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from sqlalchemy import create_engine, select, update, func, or_
 from sqlalchemy.orm import Session
@@ -21,15 +20,14 @@ from sqlalchemy.dialects.postgresql import insert
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    DATABASE_URL, EMBEDDING_API_URL, EMBEDDING_API_KEY,
-    EMBEDDING_MODEL, CRAWL_DELAY_MS, MAX_DEPTH,
-    REQUEST_TIMEOUT, USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE, EMBEDDING_ENABLED,
+    DATABASE_URL, MAX_DEPTH,
+    USER_AGENTS, MAX_LINKS_PER_DOMAIN_PER_PAGE,
     PLAYWRIGHT_FALLBACK_TO_PENDING, MAX_INTERNAL_LINKS_PER_PAGE,
     EXTERNAL_LINK_PRIORITY, INTERNAL_LINK_PRIORITY, PLAYWRIGHT_CONTEXT_RECYCLE_EVERY,
     PLAYWRIGHT_NAVIGATION_TIMEOUT, PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS,
     PLAYWRIGHT_POST_RENDER_WAIT_MS, PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS,
     PLAYWRIGHT_CRAWL_DELAY_MS, MAX_QUEUE_URL_LENGTH, EXCLUDED_QUEUE_DOMAINS,
-    WATCHDOG_TIMEOUT_MINUTES,
+    WATCHDOG_TIMEOUT_MINUTES, MAX_PAGES_PER_DOMAIN,
 )
 from models import Page, PageLink, CrawlerQueue, DomainRule
 from watchdog import get_heartbeat
@@ -92,7 +90,7 @@ TRACKING_QUERY_KEYS = {
     "_hsenc", "_hsmi", "mkt_tok", "igshid", "ref_src",
 }
 
-TRACKING_HOSTS = {
+TRACKING_HOSTS: set[str] = {
     "www.googleadservices.com",
     "googleads.g.doubleclick.net",
     "ad.doubleclick.net",
@@ -106,6 +104,52 @@ SOCIAL_SHARE_PATH_PREFIXES = {
     ("linkedin.com", "/shareArticle"),
     ("api.whatsapp.com", "/send"),
 }
+
+NOISE_SECTION_TAGS = {"nav", "footer", "aside", "header"}
+CONTENT_TEXT_TAGS = ("h1", "h2", "h3", "p", "li")
+CRAWL_SOUP_STRAINER = SoupStrainer(
+    name=["title", "meta", "main", "article", "div", "a", "h1", "h2", "h3", "p", "li", "nav", "footer", "aside", "header"]
+)
+
+
+def is_inside_noise_section(tag) -> bool:
+    parent = tag.parent
+    while parent is not None:
+        if parent.name in NOISE_SECTION_TAGS:
+            return True
+        parent = parent.parent
+    return False
+
+
+def get_content_roots(soup: BeautifulSoup) -> list:
+    roots = []
+    seen_ids = set()
+
+    for node in soup.find_all("main"):
+        node_id = id(node)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            roots.append(node)
+
+    for node in soup.find_all("article"):
+        node_id = id(node)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            roots.append(node)
+
+    for node in soup.find_all("div", id="content"):
+        node_id = id(node)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            roots.append(node)
+
+    for node in soup.find_all("div", attrs={"role": "main"}):
+        node_id = id(node)
+        if node_id not in seen_ids:
+            seen_ids.add(node_id)
+            roots.append(node)
+
+    return roots if roots else [soup]
 
 
 def is_excluded_domain(host: str) -> bool:
@@ -231,12 +275,22 @@ def extract_text(soup: BeautifulSoup, rendered_text: str | None = None) -> tuple
     text_chunks: list[str] = []
     seen_chunks: set[str] = set()
 
-    for selector in (["article", "main"], ["h1", "h2", "h3", "p", "li"]):
-        for tag in soup.find_all(selector):
+    for root in get_content_roots(soup):
+        for tag in root.find_all(CONTENT_TEXT_TAGS):
+            if is_inside_noise_section(tag):
+                continue
             text = " ".join(tag.get_text(separator=" ", strip=True).split())
-            if text and text not in seen_chunks:
-                seen_chunks.add(text)
-                text_chunks.append(text)
+            if not text:
+                continue
+
+            min_len = 6 if tag.name in ("h1", "h2", "h3") else 30
+            if len(text) < min_len:
+                continue
+            if text in seen_chunks:
+                continue
+
+            seen_chunks.add(text)
+            text_chunks.append(text)
 
     if not text_chunks:
         meta_description = soup.find("meta", attrs={"name": "description"}) or soup.find(
@@ -255,7 +309,27 @@ def extract_text(soup: BeautifulSoup, rendered_text: str | None = None) -> tuple
 
 def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     links = []
+    roots = get_content_roots(soup)
+
+    for root in roots:
+        for tag in root.find_all("a", href=True):
+            if is_inside_noise_section(tag):
+                continue
+            href = sanitize_text(tag["href"].strip())
+            if not href:
+                continue
+            if href.startswith(("#", "mailto:", "javascript:", "tel:")):
+                continue
+            clean = normalize_discovered_url(href, base_url)
+            if clean:
+                links.append(clean)
+
+    if links:
+        return list(set(links))
+
     for tag in soup.find_all("a", href=True):
+        if is_inside_noise_section(tag):
+            continue
         href = sanitize_text(tag["href"].strip())
         if not href:
             continue
@@ -264,26 +338,8 @@ def extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
         clean = normalize_discovered_url(href, base_url)
         if clean:
             links.append(clean)
-    return list(set(links))
 
-def get_embedding(text: str) -> list[float] | None:
-    if not text or not text.strip():
-        return None
-    try:
-        headers = {"Content-Type": "application/json"}
-        if EMBEDDING_API_KEY:
-            headers["Authorization"] = f"Bearer {EMBEDDING_API_KEY}"
-        r = httpx.post(
-            EMBEDDING_API_URL,
-            json={"model": EMBEDDING_MODEL, "input": text[:4000]},
-            headers=headers,
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()["embeddings"][0]
-    except Exception as e:
-        log_warn(f"Embedding falhou: {e}")
-        return None
+    return list(set(links))
 
 def next_item(session: Session, js_only: bool = True):
     query = (
@@ -323,13 +379,26 @@ def mark_failed(session: Session, item_id: int):
     )
     session.commit()
 
+def filter_domains_under_cap(session: Session, domains: set[str]) -> set[str]:
+    if not domains:
+        return set()
+
+    counts = dict(
+        session.execute(
+            select(Page.domain, func.count(Page.id))
+            .where(Page.domain.in_(domains))
+            .group_by(Page.domain)
+        ).all()
+    )
+    return {domain for domain in domains if counts.get(domain, 0) < MAX_PAGES_PER_DOMAIN}
+
 def enqueue_links(session: Session, links: list[str], depth: int, source_url: str) -> tuple[int, int]:
     if depth >= MAX_DEPTH:
         log_dim(f"  depth {depth} atingiu MAX_DEPTH={MAX_DEPTH}; nenhum link será enfileirado")
         return 0, 0
     source_domain = get_domain(source_url)
-    external_links = []
-    internal_links = []
+    external_links: list[tuple[str, str]] = []
+    internal_links: list[tuple[str, str]] = []
     domain_counts: dict[str, int] = {}
     internal_count = 0
     for target_url in links:
@@ -342,36 +411,49 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
             if internal_count >= MAX_INTERNAL_LINKS_PER_PAGE:
                 continue
             internal_count += 1
-            internal_links.append(target_url)
+            internal_links.append((target_url, domain))
             continue
         seen_for_domain = domain_counts.get(domain, 0)
         if seen_for_domain >= MAX_LINKS_PER_DOMAIN_PER_PAGE:
             continue
         domain_counts[domain] = seen_for_domain + 1
-        external_links.append(target_url)
+        external_links.append((target_url, domain))
 
     new_links = [
         {
             "url": u,
-            "domain": get_domain(u),
+            "domain": domain,
             "priority": EXTERNAL_LINK_PRIORITY,
             "depth": depth + 1,
             "status": "pending",
             "needs_js": False,
         }
-        for u in external_links
+        for u, domain in external_links
     ]
     new_links.extend([
         {
             "url": u,
-            "domain": get_domain(u),
+            "domain": domain,
             "priority": INTERNAL_LINK_PRIORITY,
             "depth": depth + 1,
             "status": "pending",
             "needs_js": False,
         }
-        for u in internal_links
+        for u, domain in internal_links
     ])
+
+    if new_links:
+        allowed_domains = filter_domains_under_cap(
+            session,
+            {row["domain"] for row in new_links},
+        )
+        if not allowed_domains:
+            return 0, 0
+
+        new_links = [row for row in new_links if row["domain"] in allowed_domains]
+        external_links = [item for item in external_links if item[1] in allowed_domains]
+        internal_links = [item for item in internal_links if item[1] in allowed_domains]
+
     if new_links:
         stmt = insert(CrawlerQueue.__table__).values(new_links)
         stmt = stmt.on_conflict_do_update(
@@ -387,7 +469,10 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
             where=CrawlerQueue.status.in_(["pending", "failed"]),
         )
         session.execute(stmt)
-    edges = [{"source_url": source_url, "target_url": u} for u in external_links + internal_links]
+    edges = [
+        {"source_url": source_url, "target_url": target_url}
+        for target_url, _domain in (external_links + internal_links)
+    ]
     if edges:
         stmt = insert(PageLink.__table__).values(edges)
         stmt = stmt.on_conflict_do_nothing()
@@ -440,7 +525,7 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
             pass
 
         html = page.content()
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "lxml", parse_only=CRAWL_SOUP_STRAINER)
         html_length = len(html)
         log_page_step(f"HTML capturado: {html_length} bytes")
 
@@ -474,7 +559,7 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
                 page.wait_for_timeout(PLAYWRIGHT_POST_RENDER_WAIT_MS)
                 html = page.content()
                 soup.decompose() # Libera a primeira soup
-                soup = BeautifulSoup(html, "lxml")
+                soup = BeautifulSoup(html, "lxml", parse_only=CRAWL_SOUP_STRAINER)
                 try:
                     rendered_text = page.locator("body").inner_text(timeout=PLAYWRIGHT_BODY_TEXT_TIMEOUT_MS).strip()
                 except Exception:
@@ -501,24 +586,13 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
         log_dim(f"  resumo: {len(summary or '')} caracteres")
         log_dim(f"  links encontrados: {len(links)}")
 
-        embedding = None
-        if EMBEDDING_ENABLED:
-            emb_start = time.perf_counter()
-            embedding = get_embedding(summary)
-            log_dim(
-                "  embedding: "
-                f"{'sim' if embedding else 'não'} "
-                f"({format_seconds(time.perf_counter() - emb_start)})"
-            )
-        else:
-            log_dim("  embedding desativado")
-
         stmt = insert(Page.__table__).values(
             url=url,
             domain=domain,
             title=sanitize_text(title),
             summary=sanitize_text(summary),
-            embedding=embedding,
+            embedding=None,
+            language=None,
             status="indexed",
             indexed_at=datetime.now(timezone.utc),
         )
@@ -527,7 +601,8 @@ def crawl_url_playwright(url: str, depth: int, page, session: Session) -> bool:
             set_={
                 "title": sanitize_text(title),
                 "summary": sanitize_text(summary),
-                "embedding": embedding,
+                "embedding": None,
+                "language": None,
                 "status": "indexed",
                 "indexed_at": datetime.now(timezone.utc),
                 "updated_at": datetime.now(timezone.utc),
