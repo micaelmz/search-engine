@@ -620,6 +620,59 @@ def enqueue_links(session: Session, links: list[str], depth: int, source_url: st
         session.execute(stmt)
     return len(external_links), len(internal_links)
 
+
+def plan_links_for_batch(links: list[str], depth: int, source_url: str) -> tuple[list[dict], list[dict], int, int]:
+    """Prepara rows de fila/arestas em memória (sem gravar no banco)."""
+    if depth >= MAX_DEPTH:
+        return [], [], 0, 0
+
+    source_domain = get_domain(source_url)
+    queue_rows: list[dict] = []
+    edge_rows: list[dict] = []
+    external_count = 0
+    internal_count = 0
+    domain_counts: dict[str, int] = {}
+
+    for target_url in links:
+        domain = get_domain(target_url)
+        if not domain:
+            continue
+        if target_url == source_url:
+            continue
+
+        if domain == source_domain:
+            if internal_count >= MAX_INTERNAL_LINKS_PER_PAGE:
+                continue
+            internal_count += 1
+            priority = INTERNAL_LINK_PRIORITY
+        else:
+            seen_for_domain = domain_counts.get(domain, 0)
+            if seen_for_domain >= MAX_LINKS_PER_DOMAIN_PER_PAGE:
+                continue
+            domain_counts[domain] = seen_for_domain + 1
+            external_count += 1
+            priority = EXTERNAL_LINK_PRIORITY
+
+        queue_rows.append(
+            {
+                "url": target_url,
+                "domain": domain,
+                "priority": priority,
+                "depth": depth + 1,
+                "status": "pending",
+                "needs_js": False,
+            }
+        )
+        edge_rows.append(
+            {
+                "source_url": source_url,
+                "target_url": target_url,
+                "domain": domain,
+            }
+        )
+
+    return queue_rows, edge_rows, external_count, internal_count
+
 # ── Core ──────────────────────────────────────────────────────────────────────
 
 async def crawl_url_async(
@@ -742,55 +795,42 @@ async def process_batch(
     with Session(engine) as session:
         success_count = 0
         failed_count = 0
+
+        indexed_at = datetime.now(timezone.utc)
+        page_rows: list[dict] = []
+        crawled_domains: set[str] = set()
+        done_ids: list[int] = []
+        failed_ids: list[int] = []
+        js_retry_ids: list[int] = []
+        link_plans: list[tuple[str, list[dict], list[dict]]] = []
+
         for result in results:
             if result.ok:
                 log_verbose(f"[depth={result.depth}] {result.url}")
                 log_dim(f"  título: {result.title}")
                 log_dim(f"  links encontrados: {len(result.links or [])}")
 
-                stmt = insert(Page.__table__).values(
-                    url=result.url,
-                    domain=result.domain,
-                    title=sanitize_text(result.title),
-                    summary=sanitize_text(result.summary),
-                    embedding=None,
-                    language=None,
-                    status="indexed",
-                    indexed_at=datetime.now(timezone.utc),
-                )
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["url"],
-                    set_={
+                page_rows.append(
+                    {
+                        "url": result.url,
+                        "domain": result.domain,
                         "title": sanitize_text(result.title),
                         "summary": sanitize_text(result.summary),
                         "embedding": None,
                         "language": None,
                         "status": "indexed",
-                        "indexed_at": datetime.now(timezone.utc),
-                        "updated_at": datetime.now(timezone.utc),
+                        "indexed_at": indexed_at,
                     }
                 )
-                session.execute(stmt)
+                crawled_domains.add(result.domain)
+                done_ids.append(result.item_id)
 
-                session.execute(
-                    update(DomainRule)
-                    .where(DomainRule.domain == result.domain)
-                    .values(last_crawled_at=func.now())
-                )
-
-                external_links_count = enqueue_links(
-                    session,
+                queue_rows, edge_rows, _external_count, _internal_count = plan_links_for_batch(
                     result.links or [],
                     result.depth,
                     result.url,
                 )
-                mark_done(session, result.item_id)
-                external_count, internal_count = external_links_count
-                log_dim(
-                    "  indexado com sucesso → "
-                    f"{external_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
-                    f"{internal_count} internos (prio {INTERNAL_LINK_PRIORITY})"
-                )
+                link_plans.append((result.url, queue_rows, edge_rows))
                 success_count += 1
             else:
                 if result.error == "dominio_bloqueado":
@@ -810,10 +850,131 @@ async def process_batch(
                     log_err(f"Erro ao crawlear {result.url}: {result.error}")
 
                 if result.needs_js:
-                    mark_for_js_retry(session, result.item_id)
+                    js_retry_ids.append(result.item_id)
                 else:
-                    mark_failed(session, result.item_id, needs_js=False)
+                    failed_ids.append(result.item_id)
                 failed_count += 1
+
+        if page_rows:
+            stmt = insert(Page.__table__).values(page_rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["url"],
+                set_={
+                    "domain": stmt.excluded.domain,
+                    "title": stmt.excluded.title,
+                    "summary": stmt.excluded.summary,
+                    "embedding": None,
+                    "language": None,
+                    "status": "indexed",
+                    "indexed_at": stmt.excluded.indexed_at,
+                    "updated_at": func.now(),
+                }
+            )
+            session.execute(stmt)
+
+        if crawled_domains:
+            session.execute(
+                update(DomainRule)
+                .where(DomainRule.domain.in_(crawled_domains))
+                .values(last_crawled_at=func.now())
+            )
+
+        if link_plans:
+            candidate_domains = {
+                row["domain"]
+                for _url, queue_rows, _edge_rows in link_plans
+                for row in queue_rows
+            }
+            allowed_domains = filter_domains_under_cap(session, candidate_domains) if candidate_domains else set()
+
+            merged_queue_by_url: dict[str, dict] = {}
+            edge_pairs: set[tuple[str, str]] = set()
+
+            for _url, queue_rows, edge_rows in link_plans:
+                external_count = 0
+                internal_count = 0
+
+                for row in queue_rows:
+                    if row["domain"] not in allowed_domains:
+                        continue
+
+                    if row["priority"] == EXTERNAL_LINK_PRIORITY:
+                        external_count += 1
+                    else:
+                        internal_count += 1
+
+                    existing = merged_queue_by_url.get(row["url"])
+                    if existing is None:
+                        merged_queue_by_url[row["url"]] = row.copy()
+                        continue
+
+                    existing["priority"] = max(existing["priority"], row["priority"])
+                    existing["depth"] = min(existing["depth"], row["depth"])
+                    existing["needs_js"] = existing["needs_js"] or row["needs_js"]
+
+                for edge in edge_rows:
+                    if edge["domain"] not in allowed_domains:
+                        continue
+                    edge_pairs.add((edge["source_url"], edge["target_url"]))
+
+                log_dim(
+                    "  indexado com sucesso → "
+                    f"{external_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
+                    f"{internal_count} internos (prio {INTERNAL_LINK_PRIORITY})"
+                )
+
+            if merged_queue_by_url:
+                stmt = insert(CrawlerQueue.__table__).values(list(merged_queue_by_url.values()))
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["url"],
+                    set_={
+                        "domain": stmt.excluded.domain,
+                        "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
+                        "depth": func.least(CrawlerQueue.depth, stmt.excluded.depth),
+                        "status": "pending",
+                        "needs_js": or_(CrawlerQueue.needs_js.is_(True), stmt.excluded.needs_js.is_(True)),
+                        "queued_at": func.now(),
+                    },
+                    where=CrawlerQueue.status.in_(["pending", "failed"]),
+                )
+                session.execute(stmt)
+
+            if edge_pairs:
+                edge_rows = [
+                    {"source_url": source_url, "target_url": target_url}
+                    for source_url, target_url in edge_pairs
+                ]
+                stmt = insert(PageLink.__table__).values(edge_rows)
+                stmt = stmt.on_conflict_do_nothing()
+                session.execute(stmt)
+
+        if done_ids:
+            session.execute(
+                update(CrawlerQueue)
+                .where(CrawlerQueue.id.in_(done_ids))
+                .values(status="done")
+            )
+
+        if js_retry_ids:
+            session.execute(
+                update(CrawlerQueue)
+                .where(CrawlerQueue.id.in_(js_retry_ids))
+                .values(
+                    status="pending",
+                    needs_js=True,
+                    attempts=CrawlerQueue.attempts + 1,
+                )
+            )
+
+        if failed_ids:
+            session.execute(
+                update(CrawlerQueue)
+                .where(CrawlerQueue.id.in_(failed_ids))
+                .values(
+                    status="failed",
+                    attempts=CrawlerQueue.attempts + 1,
+                )
+            )
 
         if success_count or failed_count:
             log_info(
