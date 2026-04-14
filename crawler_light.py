@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup, SoupStrainer
 from sqlalchemy import create_engine, select, update, func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import OperationalError
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,6 +51,11 @@ def parse_runtime_options() -> argparse.Namespace:
 
 ARGS = parse_runtime_options()
 VERBOSE = ARGS.verbose or env_truthy(os.getenv("CRAWLER_VERBOSE"))
+DB_DEADLOCK_RETRIES = max(1, int(os.getenv("CRAWLER_DB_DEADLOCK_RETRIES", "4")))
+DB_DEADLOCK_BACKOFF_SECONDS = max(0.05, float(os.getenv("CRAWLER_DB_DEADLOCK_BACKOFF_SECONDS", "0.25")))
+DB_UPSERT_CHUNK_SIZE = max(50, int(os.getenv("CRAWLER_DB_UPSERT_CHUNK_SIZE", "250")))
+QUEUE_WRITE_LOCK_ENABLED = env_truthy(os.getenv("CRAWLER_QUEUE_WRITE_LOCK_ENABLED", "true"))
+QUEUE_WRITE_LOCK_KEY = int(os.getenv("CRAWLER_QUEUE_WRITE_LOCK_KEY", "724001"))
 
 logging.basicConfig(
     level=logging.DEBUG if VERBOSE else logging.INFO,
@@ -99,6 +105,23 @@ def estimate_min_watchdog_timeout_minutes(batch_size: int, concurrency: int, req
     # Margem para variação de latência/site lento sem mascarar travamentos reais.
     recommended_seconds = max(120, int(estimated_total * 2.0))
     return max(1, math.ceil(recommended_seconds / 60))
+
+
+def is_deadlock_error(exc: OperationalError) -> bool:
+    code = getattr(getattr(exc, "orig", None), "pgcode", None)
+    if code == "40P01":
+        return True
+    return "deadlock detected" in str(exc).lower()
+
+
+def chunk_rows(rows: list[dict], chunk_size: int) -> list[list[dict]]:
+    size = max(1, chunk_size)
+    return [rows[idx:idx + size] for idx in range(0, len(rows), size)]
+
+
+def acquire_queue_write_lock(session: Session):
+    """Serializa gravações na tabela crawler_queue para reduzir deadlocks entre workers."""
+    session.execute(select(func.pg_advisory_xact_lock(QUEUE_WRITE_LOCK_KEY)))
 
 
 def queue_snapshot(session: Session) -> tuple[int, int, int]:
@@ -820,219 +843,249 @@ async def process_batch(
         if heartbeat and (idx % heartbeat_stride == 0 or idx == len(tasks)):
             heartbeat.update()
 
-    with Session(engine) as session:
-        if heartbeat:
-            heartbeat.update()
+    for attempt in range(1, DB_DEADLOCK_RETRIES + 1):
+        try:
+            with Session(engine) as session:
+                if heartbeat:
+                    heartbeat.update()
 
-        success_count = 0
-        failed_count = 0
+                success_count = 0
+                failed_count = 0
+                should_log_details = attempt == 1
 
-        indexed_at = datetime.now(timezone.utc)
-        page_rows: list[dict] = []
-        crawled_domains: set[str] = set()
-        done_ids: list[int] = []
-        failed_ids: list[int] = []
-        js_retry_ids: list[int] = []
-        link_plans: list[tuple[str, list[dict], list[dict]]] = []
+                indexed_at = datetime.now(timezone.utc)
+                page_rows: list[dict] = []
+                crawled_domains: set[str] = set()
+                done_ids: list[int] = []
+                failed_ids: list[int] = []
+                js_retry_ids: list[int] = []
+                link_plans: list[tuple[str, list[dict], list[dict]]] = []
 
-        for result in results:
-            if result.ok:
-                log_verbose(f"[depth={result.depth}] {result.url}")
-                log_dim(f"  título: {result.title}")
-                log_dim(f"  links encontrados: {len(result.links or [])}")
+                for result in results:
+                    if result.ok:
+                        if should_log_details:
+                            log_verbose(f"[depth={result.depth}] {result.url}")
+                            log_dim(f"  título: {result.title}")
+                            log_dim(f"  links encontrados: {len(result.links or [])}")
 
-                page_rows.append(
-                    {
-                        "url": result.url,
-                        "domain": result.domain,
-                        "title": sanitize_text(result.title),
-                        "summary": sanitize_text(result.summary),
-                        "embedding": None,
-                        "language": None,
-                        "status": "indexed",
-                        "indexed_at": indexed_at,
-                    }
-                )
-                crawled_domains.add(result.domain)
-                done_ids.append(result.item_id)
+                        page_rows.append(
+                            {
+                                "url": result.url,
+                                "domain": result.domain,
+                                "title": sanitize_text(result.title),
+                                "summary": sanitize_text(result.summary),
+                                "embedding": None,
+                                "language": None,
+                                "status": "indexed",
+                                "indexed_at": indexed_at,
+                            }
+                        )
+                        crawled_domains.add(result.domain)
+                        done_ids.append(result.item_id)
 
-                queue_rows, edge_rows, _external_count, _internal_count = plan_links_for_batch(
-                    result.links or [],
-                    result.depth,
-                    result.url,
-                )
-                link_plans.append((result.url, queue_rows, edge_rows))
-                success_count += 1
-            else:
-                if result.error == "dominio_bloqueado":
-                    log_warn(f"Domínio bloqueado: {result.domain}")
-                elif result.error == "bloqueado_robots":
-                    log_warn(f"Bloqueado por robots.txt: {result.url}")
-                elif result.error == "sem_conteudo":
-                    log_warn(f"Sem conteúdo extraído: {result.url} — talvez precise de JS")
-                elif result.error and result.error.startswith("http_"):
-                    code = result.error.replace("http_", "")
-                    log_warn(f"HTTP {code} → {result.url}")
-                elif result.error == "nao_html":
-                    log_dim(f"Ignorado (não é HTML): {result.url}")
-                elif result.error == "timeout":
-                    log_err(f"Timeout: {result.url}")
-                else:
-                    log_err(f"Erro ao crawlear {result.url}: {result.error}")
-
-                if result.needs_js:
-                    js_retry_ids.append(result.item_id)
-                else:
-                    failed_ids.append(result.item_id)
-                failed_count += 1
-
-            if heartbeat and (success_count + failed_count) % 200 == 0:
-                heartbeat.update()
-
-        if page_rows:
-            stmt = insert(Page.__table__).values(page_rows)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["url"],
-                set_={
-                    "domain": stmt.excluded.domain,
-                    "title": stmt.excluded.title,
-                    "summary": stmt.excluded.summary,
-                    "embedding": None,
-                    "language": None,
-                    "status": "indexed",
-                    "indexed_at": stmt.excluded.indexed_at,
-                    "updated_at": func.now(),
-                }
-            )
-            session.execute(stmt)
-            if heartbeat:
-                heartbeat.update()
-
-        if crawled_domains:
-            session.execute(
-                update(DomainRule)
-                .where(DomainRule.domain.in_(crawled_domains))
-                .values(last_crawled_at=func.now())
-            )
-            if heartbeat:
-                heartbeat.update()
-
-        if link_plans:
-            candidate_domains = {
-                row["domain"]
-                for _url, queue_rows, _edge_rows in link_plans
-                for row in queue_rows
-            }
-            allowed_domains = filter_domains_under_cap(session, candidate_domains) if candidate_domains else set()
-
-            merged_queue_by_url: dict[str, dict] = {}
-            edge_pairs: set[tuple[str, str]] = set()
-
-            for _url, queue_rows, edge_rows in link_plans:
-                external_count = 0
-                internal_count = 0
-
-                for row in queue_rows:
-                    if row["domain"] not in allowed_domains:
-                        continue
-
-                    if row["priority"] == EXTERNAL_LINK_PRIORITY:
-                        external_count += 1
+                        queue_rows, edge_rows, _external_count, _internal_count = plan_links_for_batch(
+                            result.links or [],
+                            result.depth,
+                            result.url,
+                        )
+                        link_plans.append((result.url, queue_rows, edge_rows))
+                        success_count += 1
                     else:
-                        internal_count += 1
+                        if should_log_details:
+                            if result.error == "dominio_bloqueado":
+                                log_warn(f"Domínio bloqueado: {result.domain}")
+                            elif result.error == "bloqueado_robots":
+                                log_warn(f"Bloqueado por robots.txt: {result.url}")
+                            elif result.error == "sem_conteudo":
+                                log_warn(f"Sem conteúdo extraído: {result.url} — talvez precise de JS")
+                            elif result.error and result.error.startswith("http_"):
+                                code = result.error.replace("http_", "")
+                                log_warn(f"HTTP {code} → {result.url}")
+                            elif result.error == "nao_html":
+                                log_dim(f"Ignorado (não é HTML): {result.url}")
+                            elif result.error == "timeout":
+                                log_err(f"Timeout: {result.url}")
+                            else:
+                                log_err(f"Erro ao crawlear {result.url}: {result.error}")
 
-                    existing = merged_queue_by_url.get(row["url"])
-                    if existing is None:
-                        merged_queue_by_url[row["url"]] = row.copy()
-                        continue
+                        if result.needs_js:
+                            js_retry_ids.append(result.item_id)
+                        else:
+                            failed_ids.append(result.item_id)
+                        failed_count += 1
 
-                    existing["priority"] = max(existing["priority"], row["priority"])
-                    existing["depth"] = min(existing["depth"], row["depth"])
-                    existing["needs_js"] = existing["needs_js"] or row["needs_js"]
+                    if heartbeat and (success_count + failed_count) % 200 == 0:
+                        heartbeat.update()
 
-                for edge in edge_rows:
-                    if edge["domain"] not in allowed_domains:
-                        continue
-                    edge_pairs.add((edge["source_url"], edge["target_url"]))
+                if page_rows:
+                    sorted_page_rows = sorted(page_rows, key=lambda row: row["url"])
+                    for page_chunk in chunk_rows(sorted_page_rows, DB_UPSERT_CHUNK_SIZE):
+                        stmt = insert(Page.__table__).values(page_chunk)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["url"],
+                            set_={
+                                "domain": stmt.excluded.domain,
+                                "title": stmt.excluded.title,
+                                "summary": stmt.excluded.summary,
+                                "embedding": None,
+                                "language": None,
+                                "status": "indexed",
+                                "indexed_at": stmt.excluded.indexed_at,
+                                "updated_at": func.now(),
+                            }
+                        )
+                        session.execute(stmt)
+                        if heartbeat:
+                            heartbeat.update()
 
-                log_dim(
-                    "  indexado com sucesso → "
-                    f"{external_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
-                    f"{internal_count} internos (prio {INTERNAL_LINK_PRIORITY})"
-                )
+                if crawled_domains:
+                    session.execute(
+                        update(DomainRule)
+                        .where(DomainRule.domain.in_(sorted(crawled_domains)))
+                        .values(last_crawled_at=func.now())
+                    )
+                    if heartbeat:
+                        heartbeat.update()
 
-            if merged_queue_by_url:
-                stmt = insert(CrawlerQueue.__table__).values(list(merged_queue_by_url.values()))
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["url"],
-                    set_={
-                        "domain": stmt.excluded.domain,
-                        "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
-                        "depth": func.least(CrawlerQueue.depth, stmt.excluded.depth),
-                        "status": "pending",
-                        "needs_js": or_(CrawlerQueue.needs_js.is_(True), stmt.excluded.needs_js.is_(True)),
-                        "queued_at": func.now(),
-                    },
-                    where=CrawlerQueue.status.in_(["pending", "failed"]),
-                )
-                session.execute(stmt)
+                if link_plans:
+                    if QUEUE_WRITE_LOCK_ENABLED:
+                        acquire_queue_write_lock(session)
+                        if heartbeat:
+                            heartbeat.update()
+
+                    candidate_domains = {
+                        row["domain"]
+                        for _url, queue_rows, _edge_rows in link_plans
+                        for row in queue_rows
+                    }
+                    allowed_domains = filter_domains_under_cap(session, candidate_domains) if candidate_domains else set()
+
+                    merged_queue_by_url: dict[str, dict] = {}
+                    edge_pairs: set[tuple[str, str]] = set()
+
+                    for _url, queue_rows, edge_rows in link_plans:
+                        external_count = 0
+                        internal_count = 0
+
+                        for row in queue_rows:
+                            if row["domain"] not in allowed_domains:
+                                continue
+
+                            if row["priority"] == EXTERNAL_LINK_PRIORITY:
+                                external_count += 1
+                            else:
+                                internal_count += 1
+
+                            existing = merged_queue_by_url.get(row["url"])
+                            if existing is None:
+                                merged_queue_by_url[row["url"]] = row.copy()
+                                continue
+
+                            existing["priority"] = max(existing["priority"], row["priority"])
+                            existing["depth"] = min(existing["depth"], row["depth"])
+                            existing["needs_js"] = existing["needs_js"] or row["needs_js"]
+
+                        for edge in edge_rows:
+                            if edge["domain"] not in allowed_domains:
+                                continue
+                            edge_pairs.add((edge["source_url"], edge["target_url"]))
+
+                        if should_log_details:
+                            log_dim(
+                                "  indexado com sucesso → "
+                                f"{external_count} externos (prio {EXTERNAL_LINK_PRIORITY}) + "
+                                f"{internal_count} internos (prio {INTERNAL_LINK_PRIORITY})"
+                            )
+
+                    if merged_queue_by_url:
+                        sorted_queue_rows = sorted(merged_queue_by_url.values(), key=lambda row: row["url"])
+                        for queue_chunk in chunk_rows(sorted_queue_rows, DB_UPSERT_CHUNK_SIZE):
+                            stmt = insert(CrawlerQueue.__table__).values(queue_chunk)
+                            stmt = stmt.on_conflict_do_update(
+                                index_elements=["url"],
+                                set_={
+                                    "domain": stmt.excluded.domain,
+                                    "priority": func.greatest(CrawlerQueue.priority, stmt.excluded.priority),
+                                    "depth": func.least(CrawlerQueue.depth, stmt.excluded.depth),
+                                    "status": "pending",
+                                    "needs_js": or_(CrawlerQueue.needs_js.is_(True), stmt.excluded.needs_js.is_(True)),
+                                    "queued_at": func.now(),
+                                },
+                                where=CrawlerQueue.status.in_(["pending", "failed"]),
+                            )
+                            session.execute(stmt)
+                            if heartbeat:
+                                heartbeat.update()
+
+                    if edge_pairs:
+                        edge_rows = [
+                            {"source_url": source_url, "target_url": target_url}
+                            for source_url, target_url in edge_pairs
+                        ]
+                        edge_rows.sort(key=lambda row: (row["source_url"], row["target_url"]))
+                        for edge_chunk in chunk_rows(edge_rows, DB_UPSERT_CHUNK_SIZE):
+                            stmt = insert(PageLink.__table__).values(edge_chunk)
+                            stmt = stmt.on_conflict_do_nothing()
+                            session.execute(stmt)
+                            if heartbeat:
+                                heartbeat.update()
+
+                if done_ids:
+                    session.execute(
+                        update(CrawlerQueue)
+                        .where(CrawlerQueue.id.in_(sorted(set(done_ids))))
+                        .values(status="done")
+                    )
+                    if heartbeat:
+                        heartbeat.update()
+
+                if js_retry_ids:
+                    session.execute(
+                        update(CrawlerQueue)
+                        .where(CrawlerQueue.id.in_(sorted(set(js_retry_ids))))
+                        .values(
+                            status="pending",
+                            needs_js=True,
+                            attempts=CrawlerQueue.attempts + 1,
+                        )
+                    )
+                    if heartbeat:
+                        heartbeat.update()
+
+                if failed_ids:
+                    session.execute(
+                        update(CrawlerQueue)
+                        .where(CrawlerQueue.id.in_(sorted(set(failed_ids))))
+                        .values(
+                            status="failed",
+                            attempts=CrawlerQueue.attempts + 1,
+                        )
+                    )
+                    if heartbeat:
+                        heartbeat.update()
+
+                if success_count or failed_count:
+                    log_info(
+                        "Resumo do lote: "
+                        f"{success_count} indexadas, {failed_count} falhas"
+                    )
+
+                session.commit()
                 if heartbeat:
                     heartbeat.update()
+            break
+        except OperationalError as exc:
+            if not is_deadlock_error(exc) or attempt >= DB_DEADLOCK_RETRIES:
+                raise
 
-            if edge_pairs:
-                edge_rows = [
-                    {"source_url": source_url, "target_url": target_url}
-                    for source_url, target_url in edge_pairs
-                ]
-                stmt = insert(PageLink.__table__).values(edge_rows)
-                stmt = stmt.on_conflict_do_nothing()
-                session.execute(stmt)
-                if heartbeat:
-                    heartbeat.update()
-
-        if done_ids:
-            session.execute(
-                update(CrawlerQueue)
-                .where(CrawlerQueue.id.in_(done_ids))
-                .values(status="done")
+            wait_seconds = min(5.0, DB_DEADLOCK_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            log_warn(
+                f"Deadlock ao persistir lote (tentativa {attempt}/{DB_DEADLOCK_RETRIES}). "
+                f"Novo retry em {wait_seconds:.2f}s."
             )
             if heartbeat:
                 heartbeat.update()
-
-        if js_retry_ids:
-            session.execute(
-                update(CrawlerQueue)
-                .where(CrawlerQueue.id.in_(js_retry_ids))
-                .values(
-                    status="pending",
-                    needs_js=True,
-                    attempts=CrawlerQueue.attempts + 1,
-                )
-            )
-            if heartbeat:
-                heartbeat.update()
-
-        if failed_ids:
-            session.execute(
-                update(CrawlerQueue)
-                .where(CrawlerQueue.id.in_(failed_ids))
-                .values(
-                    status="failed",
-                    attempts=CrawlerQueue.attempts + 1,
-                )
-            )
-            if heartbeat:
-                heartbeat.update()
-
-        if success_count or failed_count:
-            log_info(
-                "Resumo do lote: "
-                f"{success_count} indexadas, {failed_count} falhas"
-            )
-
-        session.commit()
-        if heartbeat:
-            heartbeat.update()
+            await asyncio.sleep(wait_seconds)
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
@@ -1045,6 +1098,11 @@ async def async_main():
     empty_reactivate_threshold = 6  # 6 * 10s = 60s
 
     log_info(f"Concorrência async: {CRAWLER_CONCURRENCY} | Lote: {CRAWLER_BATCH_SIZE}")
+    log_info(
+        "Fila DB lock: "
+        f"{'ON' if QUEUE_WRITE_LOCK_ENABLED else 'OFF'}"
+        f" (key={QUEUE_WRITE_LOCK_KEY}, chunk={DB_UPSERT_CHUNK_SIZE})"
+    )
     limits = httpx.Limits(
         max_connections=max(50, CRAWLER_CONCURRENCY * 4),
         max_keepalive_connections=max(20, CRAWLER_CONCURRENCY * 2),
@@ -1112,6 +1170,21 @@ async def async_main():
                 await process_batch(engine, items, web_client, heartbeat=heartbeat)
             except Exception as e:
                 log_err(f"Falha ao processar lote de {len(items)} URLs: {type(e).__name__}: {e}")
+                try:
+                    item_ids = [item.id for item in items]
+                    with Session(engine) as session:
+                        session.execute(
+                            update(CrawlerQueue)
+                            .where(
+                                CrawlerQueue.id.in_(item_ids),
+                                CrawlerQueue.status == "processing",
+                            )
+                            .values(status="pending")
+                        )
+                        session.commit()
+                    log_warn(f"Lote devolvido para pending após erro ({len(item_ids)} URLs).")
+                except Exception as rollback_err:
+                    log_err(f"Falha ao devolver lote para pending: {type(rollback_err).__name__}: {rollback_err}")
                 await asyncio.sleep(2)
 
 
