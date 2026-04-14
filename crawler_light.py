@@ -10,6 +10,7 @@ import random
 import argparse
 import httpx
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode, unquote
@@ -82,6 +83,22 @@ def sanitize_text(value: str | None) -> str | None:
         return None
     # Alguns sites retornam NUL (0x00), que quebra inserts/updates no Postgres.
     return value.replace("\x00", "")
+
+
+def estimate_min_watchdog_timeout_minutes(batch_size: int, concurrency: int, request_timeout_s: int, crawl_delay_ms: int) -> int:
+    """Estimativa conservadora para evitar falso-positivo do watchdog em lotes grandes."""
+    safe_concurrency = max(1, concurrency)
+    waves = max(1, math.ceil(batch_size / safe_concurrency))
+
+    # Tempo de rede por "onda" + margem para parse/persistência em lote.
+    wave_seconds = max(1, request_timeout_s) + max(0.0, crawl_delay_ms / 1000)
+    estimated_fetch_seconds = waves * wave_seconds
+    estimated_db_seconds = max(20.0, batch_size * 0.03)
+    estimated_total = estimated_fetch_seconds + estimated_db_seconds
+
+    # Margem para variação de latência/site lento sem mascarar travamentos reais.
+    recommended_seconds = max(120, int(estimated_total * 2.0))
+    return max(1, math.ceil(recommended_seconds / 60))
 
 
 def queue_snapshot(session: Session) -> tuple[int, int, int]:
@@ -747,9 +764,13 @@ async def process_batch(
     engine,
     items: list[QueueItem],
     web_client: httpx.AsyncClient,
+    heartbeat=None,
 ):
     if not items:
         return
+
+    if heartbeat:
+        heartbeat.update()
 
     with Session(engine) as session:
         domains = {i.domain for i in items}
@@ -761,6 +782,8 @@ async def process_batch(
         robots_results = await asyncio.gather(*[
             fetch_robots(domain, web_client) for domain in missing_robots
         ])
+        if heartbeat:
+            heartbeat.update()
     else:
         robots_results = []
 
@@ -782,17 +805,25 @@ async def process_batch(
 
     sem = asyncio.Semaphore(CRAWLER_CONCURRENCY)
     tasks = [
-        crawl_url_async(
+        asyncio.create_task(crawl_url_async(
             item=i,
             rule=rules.get(i.domain, DomainRule(domain=i.domain, crawl_delay_ms=CRAWL_DELAY_MS)),
             web_client=web_client,
             sem=sem,
-        )
+        ))
         for i in items
     ]
-    results = await asyncio.gather(*tasks)
+    results: list[CrawlResult] = []
+    heartbeat_stride = max(1, min(200, CRAWLER_CONCURRENCY // 2))
+    for idx, task in enumerate(asyncio.as_completed(tasks), start=1):
+        results.append(await task)
+        if heartbeat and (idx % heartbeat_stride == 0 or idx == len(tasks)):
+            heartbeat.update()
 
     with Session(engine) as session:
+        if heartbeat:
+            heartbeat.update()
+
         success_count = 0
         failed_count = 0
 
@@ -855,6 +886,9 @@ async def process_batch(
                     failed_ids.append(result.item_id)
                 failed_count += 1
 
+            if heartbeat and (success_count + failed_count) % 200 == 0:
+                heartbeat.update()
+
         if page_rows:
             stmt = insert(Page.__table__).values(page_rows)
             stmt = stmt.on_conflict_do_update(
@@ -871,6 +905,8 @@ async def process_batch(
                 }
             )
             session.execute(stmt)
+            if heartbeat:
+                heartbeat.update()
 
         if crawled_domains:
             session.execute(
@@ -878,6 +914,8 @@ async def process_batch(
                 .where(DomainRule.domain.in_(crawled_domains))
                 .values(last_crawled_at=func.now())
             )
+            if heartbeat:
+                heartbeat.update()
 
         if link_plans:
             candidate_domains = {
@@ -938,6 +976,8 @@ async def process_batch(
                     where=CrawlerQueue.status.in_(["pending", "failed"]),
                 )
                 session.execute(stmt)
+                if heartbeat:
+                    heartbeat.update()
 
             if edge_pairs:
                 edge_rows = [
@@ -947,6 +987,8 @@ async def process_batch(
                 stmt = insert(PageLink.__table__).values(edge_rows)
                 stmt = stmt.on_conflict_do_nothing()
                 session.execute(stmt)
+                if heartbeat:
+                    heartbeat.update()
 
         if done_ids:
             session.execute(
@@ -954,6 +996,8 @@ async def process_batch(
                 .where(CrawlerQueue.id.in_(done_ids))
                 .values(status="done")
             )
+            if heartbeat:
+                heartbeat.update()
 
         if js_retry_ids:
             session.execute(
@@ -965,6 +1009,8 @@ async def process_batch(
                     attempts=CrawlerQueue.attempts + 1,
                 )
             )
+            if heartbeat:
+                heartbeat.update()
 
         if failed_ids:
             session.execute(
@@ -975,6 +1021,8 @@ async def process_batch(
                     attempts=CrawlerQueue.attempts + 1,
                 )
             )
+            if heartbeat:
+                heartbeat.update()
 
         if success_count or failed_count:
             log_info(
@@ -983,6 +1031,8 @@ async def process_batch(
             )
 
         session.commit()
+        if heartbeat:
+            heartbeat.update()
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
@@ -1002,7 +1052,25 @@ async def async_main():
     timeout = httpx.Timeout(REQUEST_TIMEOUT)
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as web_client:
-        heartbeat = get_heartbeat(WATCHDOG_TIMEOUT_MINUTES)
+        configured_watchdog_minutes = WATCHDOG_TIMEOUT_MINUTES
+        min_recommended_watchdog_minutes = estimate_min_watchdog_timeout_minutes(
+            batch_size=CRAWLER_BATCH_SIZE,
+            concurrency=CRAWLER_CONCURRENCY,
+            request_timeout_s=REQUEST_TIMEOUT,
+            crawl_delay_ms=CRAWL_DELAY_MS,
+        )
+
+        effective_watchdog_minutes = configured_watchdog_minutes
+        if configured_watchdog_minutes > 0:
+            effective_watchdog_minutes = max(configured_watchdog_minutes, min_recommended_watchdog_minutes)
+            if effective_watchdog_minutes > configured_watchdog_minutes:
+                log_warn(
+                    "WATCHDOG_TIMEOUT_MINUTES baixo para o lote/concurrency atual; "
+                    f"usando timeout efetivo de {effective_watchdog_minutes} min "
+                    f"(env={configured_watchdog_minutes} min)."
+                )
+
+        heartbeat = get_heartbeat(effective_watchdog_minutes)
         heartbeat.start()
 
         while True:
@@ -1041,7 +1109,7 @@ async def async_main():
             log_info(f"\n{'─'*60}")
             log_info(f"Processando lote com {len(items)} URLs")
             try:
-                await process_batch(engine, items, web_client)
+                await process_batch(engine, items, web_client, heartbeat=heartbeat)
             except Exception as e:
                 log_err(f"Falha ao processar lote de {len(items)} URLs: {type(e).__name__}: {e}")
                 await asyncio.sleep(2)
